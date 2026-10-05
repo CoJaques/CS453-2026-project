@@ -32,6 +32,7 @@
 #include <deque>
 #include <exception>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include <variant>
 #include <vector>
@@ -40,6 +41,16 @@
 #include "common.hpp"
 #include "transactional.hpp"
 #include "workload.hpp"
+
+// -------------------------------------------------------------------------- //
+
+namespace Exception {
+EXCEPTION(TooSlow, BoundedOverrun, "Transactional library is too slow compared to the reference; execution stopped");
+}
+
+/** Exit code when the tested library is stopped for being too slow (distinct from other failures, for the submission server).
+**/
+constexpr static int exit_too_slow = 3;
 
 // -------------------------------------------------------------------------- //
 
@@ -78,6 +89,7 @@ public:
     **/
     void master_notify() noexcept {
         status.store(Status::Wait, ::std::memory_order_relaxed);
+        runtime.reset();
         runtime.start();
     }
     /** Master trigger termination in all threads (instead of notifying).
@@ -92,7 +104,7 @@ public:
     ::std::variant<Chrono, char const*> master_wait(Chrono::Tick maxtick = Chrono::invalid_tick) {
         // Wait for all worker threads, synchronize-with the last one
         if (!donelatch.wait(maxtick))
-            throw Exception::BoundedOverrun{"Transactional library takes too long to process the transactions"};
+            throw Exception::TooSlow{};
         // Return runtime on success, of error message on failure
         switch (status.load(::std::memory_order_relaxed)) {
         case Status::Done:
@@ -148,14 +160,12 @@ public:
 /** Measure the arithmetic mean of the execution time of the given workload with the given transaction library.
  * @param workload     Workload instance to use
  * @param nbthreads    Number of concurrent threads to use
- * @param nbrepeats    Number of repetitions (keep the median)
+ * @param nbrepeats    Number of repetitions (average them, except the two slowest; at least 3)
  * @param seed         Seed to use for performance measurements
- * @param maxtick_init Timeout for (re)initialization ('Chrono::invalid_tick' for none)
- * @param maxtick_perf Timeout for performance measurements ('Chrono::invalid_tick' for none)
- * @param maxtick_chck Timeout for correctness check ('Chrono::invalid_tick' for none)
- * @return Error constant null-terminated string ('nullptr' for none), execution times (in ns) (undefined if inconsistency detected)
+ * @param maxtick      Timeout for the whole measurement ('Chrono::invalid_tick' for none); to stop early, the total execution time must also stay below 'maxtick * k / nbrepeats' at the end of the k-th performance measurement
+ * @return Error constant null-terminated string ('nullptr' for none), execution times (in ns) of the initialization, of a performance measurement (averaged as described above) and of the correctness check, and total execution time (undefined if inconsistency detected)
 **/
-static auto measure(Workload& workload, unsigned int const nbthreads, unsigned int const nbrepeats, Seed seed, Chrono::Tick maxtick_init, Chrono::Tick maxtick_perf, Chrono::Tick maxtick_chck) {
+static auto measure(Workload& workload, unsigned int const nbthreads, unsigned int const nbrepeats, Seed seed, Chrono::Tick maxtick) {
     ::std::vector<::std::thread> threads(nbthreads);
     ::std::mutex  cerrlock;        // To avoid interleaving writes to 'cerr' in case more than one thread throw
     Sync          sync{nbthreads}; // "As-synchronized-as-possible" starts so that threads interfere "as-much-as-possible"
@@ -210,43 +220,57 @@ static auto measure(Workload& workload, unsigned int const nbthreads, unsigned i
         Chrono::Tick time_init = Chrono::invalid_tick;
         Chrono::Tick times[nbrepeats];
         Chrono::Tick time_chck = Chrono::invalid_tick;
-        auto const posmedian = nbrepeats / 2;
+        Chrono::Tick time_perf = Chrono::invalid_tick;
+        Chrono::Tick elapsed = 0; // Total execution time so far
+        auto timeout = [&](unsigned int k) { // Timeout for the next step: time left until 'maxtick * k / nbrepeats'
+            if (maxtick == Chrono::invalid_tick)
+                return Chrono::invalid_tick;
+            auto deadline = maxtick / nbrepeats * k;
+            auto res = elapsed < deadline ? deadline - elapsed : Chrono::Tick{1};
+            if (unlikely(res == Chrono::invalid_tick)) // Bad luck...
+                ++res;
+            return res;
+        };
         { // Initialization (with cheap correctness test)
             sync.master_notify(); // We tell workers to start working.
-            auto res = sync.master_wait(maxtick_init); // If running the student's version, it will timeout if way slower than the reference.
+            auto res = sync.master_wait(timeout(1)); // Counted as part of the first performance measurement. If running the student's version, it will timeout if way slower than the reference.
             if (unlikely(::std::holds_alternative<char const*>(res))) { // If an error happened (timeout or violation), we return early!
                 error = ::std::get<char const*>(res);
                 goto join;
             }
             time_init = ::std::get<Chrono>(res).get_tick();
+            elapsed += time_init;
         }
         { // Performance measurements (with cheap correctness tests)
             for (unsigned int i = 0; i < nbrepeats; ++i) {
                 sync.master_notify();
-                auto res = sync.master_wait(maxtick_perf);
+                auto res = sync.master_wait(timeout(i + 1));
                 if (unlikely(::std::holds_alternative<char const*>(res))) {
                     error = ::std::get<char const*>(res);
                     goto join;
                 }
                 times[i] = ::std::get<Chrono>(res).get_tick();
+                elapsed += times[i];
             }
-            ::std::nth_element(times, times + posmedian, times + nbrepeats); // Partition times around the median
+            ::std::sort(times, times + nbrepeats); // Average the times, except the two slowest
+            time_perf = ::std::accumulate(times, times + nbrepeats - 2, Chrono::Tick{0}) / (nbrepeats - 2);
         }
         { // Correctness check
             sync.master_notify();
-            auto res = sync.master_wait(maxtick_chck);
+            auto res = sync.master_wait(timeout(nbrepeats));
             if (unlikely(::std::holds_alternative<char const*>(res))) {
                 error = ::std::get<char const*>(res);
                 goto join;
             }
             time_chck = ::std::get<Chrono>(res).get_tick();
+            elapsed += time_chck;
         }
         join: { // Joining
             sync.master_join(); // Join with threads
             for (unsigned int i = 0; i < nbthreads; ++i)
                 threads[i].join();
         }
-        return ::std::make_tuple(error, time_init, times[posmedian], time_chck);
+        return ::std::make_tuple(error, time_init, time_perf, time_chck, elapsed);
     } catch (...) {
         for (unsigned int i = 0; i < nbthreads; ++i) // Detach threads to avoid termination due to attached thread going out of scope
             threads[i].detach();
@@ -495,8 +519,19 @@ static bool check_shortcuts(TransactionalLibrary& tl, Seed seed) {
 int main(int argc, char** argv) {
     try {
         // Parse command line option(s)
+        auto const progname = argc > 0 ? argv[0] : "grading";
+        auto slow_factor = 32.; // The tested library is stopped as soon as it falls behind this factor times the reference's pace (see 'measure')
+        if (argc > 1 && ::std::strncmp(argv[1], "--slow-factor=", 14) == 0) { // The submission server uses a stricter factor
+            slow_factor = ::std::stod(argv[1] + 14);
+            if (!(slow_factor > 0.)) {
+                ::std::cout << "Invalid slow factor: " << argv[1] + 14 << ::std::endl;
+                return 1;
+            }
+            ++argv;
+            --argc;
+        }
         if (argc < 3) {
-            ::std::cout << "Usage: " << (argc > 0 ? argv[0] : "grading") << " <seed> <reference library path> <tested library path>..." << ::std::endl;
+            ::std::cout << "Usage: " << progname << " [--slow-factor=<factor>] <seed> <reference library path> <tested library path>..." << ::std::endl;
             return 1;
         }
         // Get/set/compute run parameters
@@ -515,7 +550,6 @@ int main(int argc, char** argv) {
         auto const nbrepeats     = 7;
         auto const seed          = static_cast<Seed>(::std::stoul(argv[1]));
         auto const clk_res       = Chrono::get_resolution();
-        auto const slow_factor   = 8ul;
         // Print run parameters
         ::std::cout << "⎧ #worker threads:     " << nbworkers << ::std::endl;
         ::std::cout << "⎪ #TX per worker:      " << nbtxperwrk << ::std::endl;
@@ -536,18 +570,16 @@ int main(int argc, char** argv) {
         // Library evaluations
         double reference = 0.; // Set to avoid irrelevant '-Wmaybe-uninitialized'
         auto const pertxdiv = static_cast<double>(nbworkers) * static_cast<double>(nbtxperwrk);
-        auto maxtick_init = Chrono::invalid_tick;
-        auto maxtick_perf = Chrono::invalid_tick;
-        auto maxtick_chck = Chrono::invalid_tick;
+        auto maxtick = Chrono::invalid_tick;
         for (auto i = 2; i < argc; ++i) {
-            ::std::cout << "⎧ Evaluating '" << argv[i] << "'" << (maxtick_init == Chrono::invalid_tick ? " (reference)" : "") << "..." << ::std::endl;
+            ::std::cout << "⎧ Evaluating '" << argv[i] << "'" << (maxtick == Chrono::invalid_tick ? " (reference)" : "") << "..." << ::std::endl;
             // Load TM library
             TransactionalLibrary tl{argv[i]};
             // Initialize workload (shared memory lifetime bound to workload: created and destroyed at the same time)
             WorkloadBank bank{tl, nbworkers, nbtxperwrk, nbaccounts, expnbaccounts, init_balance, prob_long, prob_alloc};
             try {
                 // Actual performance measurements and correctness check
-                auto res = measure(bank, nbworkers, nbrepeats, seed, maxtick_init, maxtick_perf, maxtick_chck);
+                auto res = measure(bank, nbworkers, nbrepeats, seed, maxtick);
                 // Check false negative-free correctness
                 auto error = ::std::get<0>(res);
                 if (unlikely(error)) {
@@ -555,21 +587,14 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 // Print results
-                auto tick_init = ::std::get<1>(res);
                 auto tick_perf = ::std::get<2>(res);
-                auto tick_chck = ::std::get<3>(res);
                 auto perfdbl = static_cast<double>(tick_perf);
-                ::std::cout << "⎪ Total user execution time: " << (perfdbl / 1000000.) << " ms";
-                if (maxtick_init == Chrono::invalid_tick) { // Set reference performance
-                    maxtick_init = slow_factor * tick_init;
-                    if (unlikely(maxtick_init == Chrono::invalid_tick)) // Bad luck...
-                        ++maxtick_init;
-                    maxtick_perf = slow_factor * tick_perf;
-                    if (unlikely(maxtick_perf == Chrono::invalid_tick)) // Bad luck...
-                        ++maxtick_perf;
-                    maxtick_chck = slow_factor * tick_chck;
-                    if (unlikely(maxtick_chck == Chrono::invalid_tick)) // Bad luck...
-                        ++maxtick_chck;
+                ::std::cout << "⎪ Average round execution time: " << (perfdbl / 1000000.) << " ms";
+                if (maxtick == Chrono::invalid_tick) { // Set reference performance
+                    maxtick = static_cast<Chrono::Tick>(slow_factor * ::std::get<4>(res));
+                    if (unlikely(maxtick == Chrono::invalid_tick)) // Bad luck...
+                        ++maxtick;
+
                     reference = perfdbl;
                 } else { // Compare with reference performance
                     ::std::cout << " -> " << (reference / perfdbl) << " speedup";
@@ -588,10 +613,11 @@ int main(int argc, char** argv) {
             } catch (::std::exception const& err) { // Special case: cannot unload library with running threads, so print error and quick-exit
                 ::std::cerr << "⎪ *** EXCEPTION ***" << ::std::endl;
                 ::std::cerr << "⎩ " << err.what() << ::std::endl;
+                auto const code = dynamic_cast<Exception::TooSlow const*>(&err) ? exit_too_slow : 2;
 #ifdef __APPLE__
-                ::std::exit(2);
+                ::std::exit(code);
 #else
-                ::std::quick_exit(2);
+                ::std::quick_exit(code);
 #endif
             }
         }
