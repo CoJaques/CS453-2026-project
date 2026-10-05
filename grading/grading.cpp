@@ -521,17 +521,32 @@ int main(int argc, char** argv) {
         // Parse command line option(s)
         auto const progname = argc > 0 ? argv[0] : "grading";
         auto slow_factor = 32.; // The tested library is stopped as soon as it falls behind this factor times the reference's pace (see 'measure')
-        if (argc > 1 && ::std::strncmp(argv[1], "--slow-factor=", 14) == 0) { // The submission server uses a stricter factor
-            slow_factor = ::std::stod(argv[1] + 14);
-            if (!(slow_factor > 0.)) {
-                ::std::cout << "Invalid slow factor: " << argv[1] + 14 << ::std::endl;
+        auto given_perf = Chrono::invalid_tick; // Reference's average round execution time, if given instead of measured
+        auto given_total = Chrono::invalid_tick; // Reference's total execution time, if given instead of measured
+        while (argc > 1 && ::std::strncmp(argv[1], "--", 2) == 0) {
+            if (::std::strncmp(argv[1], "--slow-factor=", 14) == 0) { // The submission server uses a stricter factor
+                slow_factor = ::std::stod(argv[1] + 14);
+                if (!(slow_factor > 0.)) {
+                    ::std::cout << "Invalid slow factor: " << argv[1] + 14 << ::std::endl;
+                    return 1;
+                }
+            } else if (::std::strncmp(argv[1], "--reference-times=", 18) == 0) { // The submission server only measures the reference once, beforehand
+                char* end;
+                given_perf = ::std::strtoull(argv[1] + 18, &end, 10);
+                given_total = *end == ':' ? ::std::strtoull(end + 1, &end, 10) : 0;
+                if (*end != '\0' || given_perf == 0 || given_total == 0 || given_perf == Chrono::invalid_tick || given_total == Chrono::invalid_tick) {
+                    ::std::cout << "Invalid reference times (expected '<average round time>:<total time>', in ns): " << argv[1] + 18 << ::std::endl;
+                    return 1;
+                }
+            } else {
+                ::std::cout << "Unknown option: " << argv[1] << ::std::endl;
                 return 1;
             }
             ++argv;
             --argc;
         }
         if (argc < 3) {
-            ::std::cout << "Usage: " << progname << " [--slow-factor=<factor>] <seed> <reference library path> <tested library path>..." << ::std::endl;
+            ::std::cout << "Usage: " << progname << " [--slow-factor=<factor>] [--reference-times=<average round time>:<total time>] <seed> <reference library path> [<tested library path>...]" << ::std::endl;
             return 1;
         }
         // Get/set/compute run parameters
@@ -571,7 +586,17 @@ int main(int argc, char** argv) {
         double reference = 0.; // Set to avoid irrelevant '-Wmaybe-uninitialized'
         auto const pertxdiv = static_cast<double>(nbworkers) * static_cast<double>(nbtxperwrk);
         auto maxtick = Chrono::invalid_tick;
-        for (auto i = 2; i < argc; ++i) {
+        auto first = 2; // First library to evaluate (the reference, unless its times are given)
+        if (given_perf != Chrono::invalid_tick) {
+            maxtick = static_cast<Chrono::Tick>(slow_factor * given_total);
+            if (unlikely(maxtick == Chrono::invalid_tick)) // Bad luck...
+                ++maxtick;
+            reference = static_cast<double>(given_perf);
+            ::std::cout << "⎧ Reference '" << argv[2] << "' measured beforehand..." << ::std::endl;
+            ::std::cout << "⎩ Average round execution time: " << (reference / 1000000.) << " ms" << ::std::endl;
+            first = 3;
+        }
+        for (auto i = first; i < argc; ++i) {
             ::std::cout << "⎧ Evaluating '" << argv[i] << "'" << (maxtick == Chrono::invalid_tick ? " (reference)" : "") << "..." << ::std::endl;
             // Load TM library
             TransactionalLibrary tl{argv[i]};
@@ -594,14 +619,14 @@ int main(int argc, char** argv) {
                     maxtick = static_cast<Chrono::Tick>(slow_factor * ::std::get<4>(res));
                     if (unlikely(maxtick == Chrono::invalid_tick)) // Bad luck...
                         ++maxtick;
-
                     reference = perfdbl;
+                    ::std::cout << ::std::endl << "⎪ Reference times:   " << tick_perf << ":" << ::std::get<4>(res) << " ns (see '--reference-times')";
                 } else { // Compare with reference performance
                     ::std::cout << " -> " << (reference / perfdbl) << " speedup";
                 }
                 ::std::cout << ::std::endl;
                 ::std::cout << "⎩ Average TX execution time: " << (perfdbl / pertxdiv) << " ns" << ::std::endl;
-                if (i == argc - 1) { // We run additional checks on the last implementation.
+                if (i == argc - 1 && i > 2) { // We run additional checks on the last implementation (if not the reference).
                     ::std::cout << "⎧ Checking whether '" << argv[i] << "' took shortcuts..." << ::std::endl;
                     auto ok = check_shortcuts(tl, seed);
                     if (unlikely(!ok)) {
