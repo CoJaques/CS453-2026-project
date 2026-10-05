@@ -53,6 +53,8 @@ EXCEPTION(Transaction, Any, "transaction manager exception");
     EXCEPTION(TransactionAlloc, Transaction, "memory allocation failed (insufficient memory)");
     EXCEPTION(TransactionRetry, Transaction, "transaction aborted and can be retried");
     EXCEPTION(TransactionNotLastSegment, Transaction, "trying to deallocate the first segment");
+    EXCEPTION(TransactionNullStart, Transaction, "'tm_start' returned a null pointer (0); you are not allowed to use 0 as a pointer to shared memory");
+    EXCEPTION(TransactionNullAlloc, Transaction, "'tm_alloc' succeeded but returned a null pointer (0); you are not allowed to use 0 as a pointer to shared memory");
 EXCEPTION(Shared, Any, "operation in shared memory exception");
     EXCEPTION(SharedAlign, Shared, "address in shared memory is not properly aligned for the specified type");
     EXCEPTION(SharedOverflow, Shared, "index is past array length");
@@ -177,6 +179,8 @@ public:
             if (unlikely(shared == STM::invalid_shared))
                 throw Exception::TransactionCreate{};
             start_addr = tl.tm_start(shared);
+            if (unlikely(!start_addr))
+                throw Exception::TransactionNullStart{};
         }, "The transactional library takes too long creating the shared memory");
     }
     /** Unbind destructor.
@@ -337,6 +341,11 @@ public:
         void* target;
         switch (tm.alloc(tx, size, &target)) {
         case STM::Alloc::success:
+            if (unlikely(!target)) {
+                tm.end(tx); // End now (releasing what the library may hold) rather than in the destructor, which could throw while unwinding
+                aborted = true;
+                throw Exception::TransactionNullAlloc{};
+            }
             return target;
         case STM::Alloc::nomem:
             throw Exception::TransactionAlloc{};
