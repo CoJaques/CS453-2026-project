@@ -87,7 +87,25 @@ shared_t tm_create(size_t size, size_t align)
 **/
 void tm_destroy(shared_t unused(shared))
 {
-	// TODO: tm_destroy(shared_t)
+	region_t *region = (region_t *)shared;
+
+	if (unlikely(!region)) {
+		return;
+	}
+
+	segment_t *current = region->head;
+
+	while (current) {
+		segment_t *next = current->next;
+		free(current->data);
+		free(current);
+		current = next;
+	}
+
+	free(region->batcher);
+	free(region);
+
+	return;
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
