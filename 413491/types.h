@@ -1,7 +1,7 @@
-#include "tm.h"
+#pragma once
 
-typedef struct {
-} batcher_t;
+#include "tm.h"
+#include "batcher.h"
 
 typedef struct segment_t {
 	shared_t data;

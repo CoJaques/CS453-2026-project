@@ -48,11 +48,17 @@ shared_t tm_create(size_t size, size_t align)
 	if (unlikely(!region)) {
 		return invalid_shared;
 	}
+
 	region->size = size;
 	region->align = align;
 
 	batcher_t *batcher = malloc(sizeof(batcher_t));
 	if (unlikely(!batcher)) {
+		free(region);
+		return invalid_shared;
+	}
+	if (unlikely(!batcher_init(batcher))) {
+		free(batcher);
 		free(region);
 		return invalid_shared;
 	}
@@ -62,6 +68,7 @@ shared_t tm_create(size_t size, size_t align)
 	segment_t *initial_segment = calloc(1, sizeof(segment_t));
 
 	if (unlikely(!initial_segment)) {
+		batcher_destroy(batcher);
 		free(batcher);
 		free(region);
 		return invalid_shared;
@@ -72,6 +79,7 @@ shared_t tm_create(size_t size, size_t align)
 	if (unlikely(posix_memalign(&initial_segment->data, align, size) !=
 		     0)) {
 		free(initial_segment);
+		batcher_destroy(batcher);
 		free(batcher);
 		free(region);
 		return invalid_shared;
@@ -102,6 +110,7 @@ void tm_destroy(shared_t unused(shared))
 		current = next;
 	}
 
+	batcher_destroy(region->batcher);
 	free(region->batcher);
 	free(region);
 
@@ -112,19 +121,20 @@ void tm_destroy(shared_t unused(shared))
  * @param shared Shared memory region to query
  * @return Start address of the first allocated segment
 **/
-void *tm_start(shared_t unused(shared))
+void *tm_start(shared_t shared)
 {
-	// TODO: tm_start(shared_t)
-	return NULL;
+	region_t *region = (region_t *)shared;
+	return region->head->data;
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
  * @param shared Shared memory region to query
  * @return First allocated segment size
 **/
-size_t tm_size(shared_t unused(shared))
+size_t tm_size(shared_t shared)
 {
-	// TODO: tm_size(shared_t)
+	region_t *region = (region_t *)shared;
+	return region->size;
 	return 0;
 }
 
@@ -132,9 +142,10 @@ size_t tm_size(shared_t unused(shared))
  * @param shared Shared memory region to query
  * @return Alignment used globally
 **/
-size_t tm_align(shared_t unused(shared))
+size_t tm_align(shared_t shared)
 {
-	// TODO: tm_align(shared_t)
+	region_t *region = (region_t *)shared;
+	return region->align;
 	return 0;
 }
 
@@ -199,10 +210,10 @@ bool tm_write(shared_t unused(shared), tx_t unused(tx),
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
-alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size),
-		 void **unused(target))
+alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
 {
-	// TODO: tm_alloc(shared_t, tx_t, size_t, void**)
+	region_t *region = (region_t *)shared;
+
 	return abort_alloc;
 }
 
