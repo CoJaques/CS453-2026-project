@@ -32,6 +32,83 @@
 #include "types.h"
 #include "macros.h"
 
+/** Destroy a fully initialized segment with no concurrent users.
+ * @param segment Segment whose buffers and controls are released
+ * @param align Size of a word in the associated region
+**/
+static void segment_destroy(segment_t *segment, size_t align)
+{
+	for (size_t i = 0; i < segment->size / align; ++i) {
+		if (pthread_mutex_destroy(&segment->status[i].mutex) != 0) {
+			abort();
+		}
+	}
+	free(segment->status);
+	free(segment->data[1]);
+	free(segment->data[0]);
+	free(segment);
+}
+
+/** Create a zero-initialized dual-versioned segment.
+ * @param size Positive segment size, a multiple of align
+ * @param align Positive power-of-two word size
+ * @return Initialized segment, or NULL after cleanup on failure
+**/
+static segment_t *segment_create(size_t size, size_t align)
+{
+	size_t word_count = size / align;
+	if (word_count > SIZE_MAX / sizeof(word_status_t)) {
+		return NULL;
+	}
+
+	segment_t *segment = calloc(1, sizeof(segment_t));
+	if (unlikely(!segment)) {
+		return NULL;
+	}
+	segment->size = size;
+	segment->next = NULL;
+	size_t initialized_words = 0;
+	size_t allocation_align = align < sizeof(void *) ? sizeof(void *) : align;
+
+	for (size_t copy = 0; copy < 2; ++copy) {
+		if (posix_memalign(&segment->data[copy], allocation_align, size) != 0) {
+			goto fail;
+		}
+		memset(segment->data[copy], 0, size);
+	}
+
+	segment->status = calloc(word_count, sizeof(word_status_t));
+	if (unlikely(!segment->status)) {
+		goto fail;
+	}
+	for (size_t i = 0; i < word_count; ++i) {
+		word_status_t *status = &segment->status[i];
+		status->read_copy = 0;
+		status->written = false;
+		status->epoch = 0;
+		status->access_state = ACCESS_NONE;
+		status->owner = invalid_tx;
+		if (pthread_mutex_init(&status->mutex, NULL) != 0) {
+			goto fail;
+		}
+		++initialized_words;
+	}
+	return segment;
+
+fail:
+	// Only mutexes whose initialization succeeded may be destroyed.
+	for (size_t i = 0; i < initialized_words; ++i) {
+		if (pthread_mutex_destroy(&segment->status[i].mutex) != 0) {
+			abort();
+		}
+	}
+	free(segment->status);
+	free(segment->data[1]);
+	free(segment->data[0]);
+	free(segment);
+	return NULL;
+}
+
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
  * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
@@ -65,7 +142,7 @@ shared_t tm_create(size_t size, size_t align)
 
 	region->batcher = batcher;
 
-	segment_t *initial_segment = calloc(1, sizeof(segment_t));
+	segment_t *initial_segment = segment_create(size, align);
 
 	if (unlikely(!initial_segment)) {
 		batcher_destroy(batcher);
@@ -75,17 +152,6 @@ shared_t tm_create(size_t size, size_t align)
 	}
 
 	region->head = initial_segment;
-
-	if (unlikely(posix_memalign(&initial_segment->data, align, size) !=
-		     0)) {
-		free(initial_segment);
-		batcher_destroy(batcher);
-		free(batcher);
-		free(region);
-		return invalid_shared;
-	}
-
-	memset(initial_segment->data, 0, size);
 
 	return (shared_t)region;
 }
@@ -105,8 +171,7 @@ void tm_destroy(shared_t unused(shared))
 
 	while (current) {
 		segment_t *next = current->next;
-		free(current->data);
-		free(current);
+		segment_destroy(current, region->align);
 		current = next;
 	}
 
@@ -124,7 +189,8 @@ void tm_destroy(shared_t unused(shared))
 void *tm_start(shared_t shared)
 {
 	region_t *region = (region_t *)shared;
-	return region->head->data;
+	// The public address is stable even when a word's readable copy changes.
+	return region->head->data[0];
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
@@ -135,7 +201,6 @@ size_t tm_size(shared_t shared)
 {
 	region_t *region = (region_t *)shared;
 	return region->size;
-	return 0;
 }
 
 /** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
@@ -146,7 +211,6 @@ size_t tm_align(shared_t shared)
 {
 	region_t *region = (region_t *)shared;
 	return region->align;
-	return 0;
 }
 
 /** [thread-safe] Begin a new transaction on the given shared memory region.
