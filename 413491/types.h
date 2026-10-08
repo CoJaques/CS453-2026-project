@@ -32,14 +32,17 @@ typedef struct segment_ref_t {
 	struct segment_ref_t *next; // Independent of the region's segment list.
 } segment_ref_t;
 
+typedef struct transaction_t transaction_t;
+
 typedef struct {
 	size_t size;
 	size_t align;
 	batcher_t *batcher;
 	segment_t *head;
+	transaction_t *committed; // Protected by batcher->mutex; drain at epoch end.
 } region_t;
 
-typedef struct {
+struct transaction_t {
 	tx_t id;
 	bool is_ro;
 	uint64_t epoch;
@@ -48,4 +51,5 @@ typedef struct {
 	size_t written_capacity;
 	segment_ref_t *segment_allocated;
 	segment_ref_t *segment_to_free;
-} transaction_t;
+	transaction_t *next_committed;
+};

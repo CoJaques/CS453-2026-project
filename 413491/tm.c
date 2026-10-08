@@ -20,6 +20,7 @@
 #endif
 
 // Requested features
+#include <pthread.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -112,11 +113,11 @@ fail:
 	return NULL;
 }
 
-/** Abandon a transaction and leave its batch after releasing private resources.
- * @param region Region in whose batch the transaction participates
+/** Release a context and its unpublished allocations without leaving the batch.
+ * @param region Region whose alignment applies to the private segments
  * @param transaction Heap-allocated context to destroy
 **/
-static void transaction_abort(region_t *region, transaction_t *transaction)
+static void transaction_discard(region_t *region, transaction_t *transaction)
 {
 	// Tentative writes are never published; word access marks expire by epoch.
 	free(transaction->written_words);
@@ -132,6 +133,15 @@ static void transaction_abort(region_t *region, transaction_t *transaction)
 		free(ref);
 	}
 	free(transaction);
+}
+
+/** Abandon a transaction and leave its batch after releasing private resources.
+ * @param region Region in whose batch the transaction participates
+ * @param transaction Heap-allocated context to destroy
+**/
+static void transaction_abort(region_t *region, transaction_t *transaction)
+{
+	transaction_discard(region, transaction);
 	batcher_leave(region->batcher);
 }
 
@@ -379,6 +389,37 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 	return true;
 }
 
+/** Record a word on its first write by the transaction.
+ * @param transaction Context owning the growable write log
+ * @param segment Segment containing the word
+ * @param index Word index within the segment
+ * @return Whether the entry was added successfully
+**/
+static bool transaction_record_write(transaction_t *transaction,
+				     segment_t *segment, size_t index)
+{
+	if (transaction->written_count == transaction->written_capacity) {
+		size_t maximum = SIZE_MAX / sizeof(word_ref_t);
+		size_t capacity = transaction->written_capacity;
+		if (capacity >= maximum) {
+			return false;
+		}
+		capacity = capacity == 0	  ? 8 :
+			   capacity > maximum / 2 ? maximum :
+						    capacity * 2;
+		word_ref_t *words = realloc(transaction->written_words,
+					    capacity * sizeof(word_ref_t));
+		if (!words) {
+			return false;
+		}
+		transaction->written_words = words;
+		transaction->written_capacity = capacity;
+	}
+	transaction->written_words[transaction->written_count++] =
+		(word_ref_t){ .segment = segment, .index = index };
+	return true;
+}
+
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
  * @param shared Shared memory region associated with the transaction
  * @param tx     Transaction to use
@@ -399,7 +440,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 	assert((uintptr_t)source % region->align == 0);
 	assert((uintptr_t)target % region->align == 0);
 	assert(!transaction->is_ro);
-	uintptr_t address = (uintptr_t)source;
+	uintptr_t address = (uintptr_t)target;
 	segment_t *segment = NULL;
 	for (segment_ref_t *ref = transaction->segment_allocated; ref;
 	     ref = ref->next) {
@@ -422,7 +463,65 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 	size_t offset = address - (uintptr_t)segment->data[0];
 	assert(size <= segment->size - offset);
 
-	return false;
+	for (size_t done = 0; done < size; done += region->align) {
+		size_t word_offset = offset + done;
+		size_t index = word_offset / region->align;
+		word_status_t *status = &segment->status[index];
+		if (pthread_mutex_lock(&status->mutex) != 0) {
+			abort();
+		}
+		if (status->epoch != transaction->epoch) {
+			// The published copy persists; only access metadata expires.
+			status->epoch = transaction->epoch;
+			status->written = false;
+			status->access_state = ACCESS_NONE;
+			status->owner = invalid_tx;
+		}
+
+		bool authorized = false;
+		if (status->written) {
+			authorized = status->access_state == ACCESS_ONE &&
+				     status->owner == transaction->id;
+		} else {
+			authorized = status->access_state == ACCESS_NONE ||
+				     (status->access_state == ACCESS_ONE &&
+				      status->owner == transaction->id);
+		}
+
+		if (!authorized) {
+			if (pthread_mutex_unlock(&status->mutex) != 0) {
+				abort();
+			}
+			transaction_abort(shared, transaction);
+			return false;
+		}
+
+		if (!status->written) {
+			bool success = transaction_record_write(transaction,
+								segment, index);
+			if (!success) {
+				if (pthread_mutex_unlock(&status->mutex) != 0) {
+					abort();
+				}
+				transaction_abort(shared, transaction);
+				return false;
+			}
+		}
+
+		uint8_t write = 1 - status->read_copy;
+
+		memcpy((unsigned char *)segment->data[write] + word_offset,
+		       (unsigned char const *)source + done, region->align);
+		status->access_state = ACCESS_ONE;
+		status->owner = transaction->id;
+		status->written = true;
+
+		if (pthread_mutex_unlock(&status->mutex) != 0) {
+			abort();
+		}
+	}
+
+	return true;
 }
 
 /** [thread-safe] Memory allocation in the given transaction.
