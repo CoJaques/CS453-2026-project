@@ -244,10 +244,23 @@ size_t tm_align(shared_t shared)
  * @param is_ro  Whether the transaction is read-only
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
-tx_t tm_begin(shared_t unused(shared), bool unused(is_ro))
+tx_t tm_begin(shared_t shared, bool is_ro)
 {
-	// TODO: tm_begin(shared_t)
-	return invalid_tx;
+	assert(shared != invalid_shared);
+	region_t *region = (region_t *)shared;
+
+	transaction_t *transaction = calloc(1, sizeof(transaction_t));
+	if (unlikely(!transaction)) {
+		return invalid_tx;
+	}
+
+	transaction->id = (tx_t)transaction;
+	transaction->is_ro = is_ro;
+
+	batcher_enter(region->batcher);
+	transaction->epoch = batcher_get_epoch(region->batcher);
+
+	return (tx_t)transaction;
 }
 
 /** [thread-safe] End the given transaction.
