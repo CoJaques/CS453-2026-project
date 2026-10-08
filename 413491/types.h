@@ -37,6 +37,7 @@ typedef struct transaction_t transaction_t;
 typedef struct {
 	size_t size;
 	size_t align;
+	unsigned int align_shift; // log2(align), computed once at region creation.
 	batcher_t *batcher;
 	segment_t *head;
 	transaction_t *committed; // Protected by batcher->mutex; drain at epoch end.
