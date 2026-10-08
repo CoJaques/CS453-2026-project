@@ -282,12 +282,101 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx))
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_read(shared_t unused(shared), tx_t unused(tx),
-	     void const *unused(source), size_t unused(size),
-	     void *unused(target))
+bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
+	     void *target)
 {
-	// TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
-	return false;
+	assert(shared != invalid_shared && source != NULL && target != NULL);
+	assert(tx != 0 && tx != invalid_tx);
+	assert(size > 0 && size % tm_align(shared) == 0);
+
+	transaction_t *transaction = (transaction_t *)tx;
+	region_t *region = (region_t *)shared;
+	assert((uintptr_t)source % region->align == 0);
+	assert((uintptr_t)target % region->align == 0);
+	uintptr_t address = (uintptr_t)source;
+	segment_t *segment = NULL;
+
+	for (segment_ref_t *ref = transaction->segment_allocated; ref;
+	     ref = ref->next) {
+		uintptr_t base = (uintptr_t)ref->segment->data[0];
+		if (address >= base && address - base < ref->segment->size) {
+			segment = ref->segment;
+			break;
+		}
+	}
+	if (!segment) {
+		// The published list stays stable throughout the current epoch.
+		for (segment = region->head; segment; segment = segment->next) {
+			uintptr_t base = (uintptr_t)segment->data[0];
+			if (address >= base && address - base < segment->size) {
+				break;
+			}
+		}
+	}
+	assert(segment != NULL);
+	size_t offset = address - (uintptr_t)segment->data[0];
+	assert(size <= segment->size - offset);
+
+	if (transaction->is_ro) {
+		// Readable copies and their selectors remain stable within this epoch.
+		for (size_t done = 0; done < size; done += region->align) {
+			size_t word_offset = offset + done;
+			size_t index = word_offset / region->align;
+			uint8_t copy = segment->status[index].read_copy;
+			assert(copy < 2);
+			memcpy((unsigned char *)target + done,
+			       (unsigned char *)segment->data[copy] +
+				       word_offset,
+			       region->align);
+		}
+		return true;
+	}
+
+	for (size_t done = 0; done < size; done += region->align) {
+		size_t word_offset = offset + done;
+		size_t index = word_offset / region->align;
+		word_status_t *status = &segment->status[index];
+		if (pthread_mutex_lock(&status->mutex) != 0) {
+			abort();
+		}
+		if (status->epoch != transaction->epoch) {
+			// The published copy persists; only access metadata expires.
+			status->epoch = transaction->epoch;
+			status->written = false;
+			status->access_state = ACCESS_NONE;
+			status->owner = invalid_tx;
+		}
+
+		uint8_t copy = status->read_copy;
+		assert(copy < 2);
+		if (status->written) {
+			if (status->access_state != ACCESS_ONE ||
+			    status->owner != transaction->id) {
+				// Abort may destroy private segments, so release the word first.
+				if (pthread_mutex_unlock(&status->mutex) != 0) {
+					abort();
+				}
+				transaction_abort(region, transaction);
+				return false;
+			}
+			copy = 1 - copy;
+		} else if (status->access_state == ACCESS_NONE) {
+			status->access_state = ACCESS_ONE;
+			status->owner = transaction->id;
+		} else if (status->access_state == ACCESS_ONE &&
+			   status->owner != transaction->id) {
+			status->access_state = ACCESS_MANY;
+			status->owner = invalid_tx;
+		}
+
+		memcpy((unsigned char *)target + done,
+		       (unsigned char *)segment->data[copy] + word_offset,
+		       region->align);
+		if (pthread_mutex_unlock(&status->mutex) != 0) {
+			abort();
+		}
+	}
+	return true;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -298,11 +387,41 @@ bool tm_read(shared_t unused(shared), tx_t unused(tx),
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
 **/
-bool tm_write(shared_t unused(shared), tx_t unused(tx),
-	      void const *unused(source), size_t unused(size),
-	      void *unused(target))
+bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
+	      void *target)
 {
-	// TODO: tm_write(shared_t, tx_t, void const*, size_t, void*)
+	assert(shared != invalid_shared && source != NULL && target != NULL);
+	assert(tx != 0 && tx != invalid_tx);
+	assert(size > 0 && size % tm_align(shared) == 0);
+
+	transaction_t *transaction = (transaction_t *)tx;
+	region_t *region = (region_t *)shared;
+	assert((uintptr_t)source % region->align == 0);
+	assert((uintptr_t)target % region->align == 0);
+	assert(!transaction->is_ro);
+	uintptr_t address = (uintptr_t)source;
+	segment_t *segment = NULL;
+	for (segment_ref_t *ref = transaction->segment_allocated; ref;
+	     ref = ref->next) {
+		uintptr_t base = (uintptr_t)ref->segment->data[0];
+		if (address >= base && address - base < ref->segment->size) {
+			segment = ref->segment;
+			break;
+		}
+	}
+	if (!segment) {
+		// The published list stays stable throughout the current epoch.
+		for (segment = region->head; segment; segment = segment->next) {
+			uintptr_t base = (uintptr_t)segment->data[0];
+			if (address >= base && address - base < segment->size) {
+				break;
+			}
+		}
+	}
+	assert(segment != NULL);
+	size_t offset = address - (uintptr_t)segment->data[0];
+	assert(size <= segment->size - offset);
+
 	return false;
 }
 
