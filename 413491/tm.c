@@ -145,6 +145,84 @@ static void transaction_abort(region_t *region, transaction_t *transaction)
 	batcher_leave(region->batcher);
 }
 
+/** Publish committed effects before the next batch starts running.
+ * Called with the batcher mutex held and no active transactions in this region.
+ * Must not lock that mutex again or call batcher_enter/leave/get_epoch.
+ * @param context Region whose completed epoch is being finalized
+**/
+static void region_finalize_epoch(void *context)
+{
+	assert(context != NULL);
+
+	region_t *region = (region_t *)context;
+	transaction_t *committed = region->committed;
+	region->committed = NULL;
+
+	// Publish all written words while every referenced segment is still alive.
+	for (transaction_t *tx = committed; tx; tx = tx->next_committed) {
+		assert(tx->epoch == region->batcher->epoch);
+		for (size_t i = 0; i < tx->written_count; ++i) {
+			word_ref_t word = tx->written_words[i];
+			word_status_t *status =
+				&word.segment->status[word.index];
+			assert(status->read_copy < 2);
+			status->read_copy = 1 - status->read_copy;
+		}
+	}
+
+	// Transfer segment ownership, preserving the initial segment at the head.
+	for (transaction_t *tx = committed; tx; tx = tx->next_committed) {
+		while (tx->segment_allocated) {
+			segment_ref_t *ref = tx->segment_allocated;
+			tx->segment_allocated = ref->next;
+			ref->segment->next = region->head->next;
+			region->head->next = ref->segment;
+			free(ref);
+		}
+	}
+
+	// Deduplicate before destroying any segment; reuse the existing request nodes.
+	segment_ref_t *unique_frees = NULL;
+	for (transaction_t *tx = committed; tx; tx = tx->next_committed) {
+		while (tx->segment_to_free) {
+			segment_ref_t *ref = tx->segment_to_free;
+			tx->segment_to_free = ref->next;
+			segment_ref_t *existing = unique_frees;
+			while (existing && existing->segment != ref->segment) {
+				existing = existing->next;
+			}
+			if (existing) {
+				free(ref);
+			} else {
+				ref->next = unique_frees;
+				unique_frees = ref;
+			}
+		}
+	}
+
+	// All allocations have been published, including those freed in the same batch.
+	while (unique_frees) {
+		segment_ref_t *ref = unique_frees;
+		unique_frees = ref->next;
+		segment_t **link = &region->head->next;
+		while (*link && *link != ref->segment) {
+			link = &(*link)->next;
+		}
+		assert(*link == ref->segment);
+		*link = ref->segment->next;
+		segment_destroy(ref->segment, region->align);
+		free(ref);
+	}
+
+	// Access metadata expires lazily; only the completed contexts need cleanup here.
+	while (committed) {
+		transaction_t *next = committed->next_committed;
+		free(committed->written_words);
+		free(committed);
+		committed = next;
+	}
+}
+
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
  * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
@@ -164,13 +242,14 @@ shared_t tm_create(size_t size, size_t align)
 
 	region->size = size;
 	region->align = align;
+	region->committed = NULL;
 
 	batcher_t *batcher = malloc(sizeof(batcher_t));
 	if (unlikely(!batcher)) {
 		free(region);
 		return invalid_shared;
 	}
-	if (unlikely(!batcher_init(batcher))) {
+	if (unlikely(!batcher_init(batcher, region_finalize_epoch, region))) {
 		free(batcher);
 		free(region);
 		return invalid_shared;
@@ -203,6 +282,12 @@ void tm_destroy(shared_t unused(shared))
 		return;
 	}
 
+	// Also release contexts whose effects have not yet been published.
+	while (region->committed) {
+		transaction_t *transaction = region->committed;
+		region->committed = transaction->next_committed;
+		transaction_discard(region, transaction);
+	}
 	segment_t *current = region->head;
 
 	while (current) {
@@ -278,10 +363,31 @@ tx_t tm_begin(shared_t shared, bool is_ro)
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
 **/
-bool tm_end(shared_t unused(shared), tx_t unused(tx))
+bool tm_end(shared_t shared, tx_t tx)
 {
-	// TODO: tm_end(shared_t, tx_t)
-	return false;
+	assert(shared != invalid_shared && tx != 0 && tx != invalid_tx);
+
+	region_t *region = (region_t *)shared;
+	transaction_t *transaction = (transaction_t *)tx;
+
+	if (transaction->is_ro) {
+		free(transaction);
+		batcher_leave(region->batcher);
+		return true;
+	}
+
+	// Retain the context and its logs until publication at the epoch boundary.
+	if (pthread_mutex_lock(&region->batcher->mutex) != 0) {
+		abort();
+	}
+	transaction->next_committed = region->committed;
+	region->committed = transaction;
+	if (pthread_mutex_unlock(&region->batcher->mutex) != 0) {
+		abort();
+	}
+
+	batcher_leave(region->batcher);
+	return true;
 }
 
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.

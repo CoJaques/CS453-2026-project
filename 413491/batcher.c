@@ -13,7 +13,8 @@ static void check_pthread(int error)
 	}
 }
 
-bool batcher_init(batcher_t *batcher)
+bool batcher_init(batcher_t *batcher, batcher_finalize_fn finalize_epoch,
+		  void *context)
 {
 	if (pthread_mutex_init(&batcher->mutex, NULL) != 0) {
 		return false;
@@ -25,6 +26,8 @@ bool batcher_init(batcher_t *batcher)
 	batcher->epoch = 0;
 	batcher->remaining = 0;
 	batcher->waiting = 0;
+	batcher->finalize_epoch = finalize_epoch;
+	batcher->finalize_context = context;
 	return true;
 }
 
@@ -45,7 +48,7 @@ void batcher_enter(batcher_t *batcher)
 		++batcher->waiting;
 		while (batcher->epoch == epoch) {
 			check_pthread(pthread_cond_wait(&batcher->changed,
-						&batcher->mutex));
+							&batcher->mutex));
 		}
 		// The last leaver already counted us in the new batch.
 	}
@@ -57,7 +60,9 @@ void batcher_leave(batcher_t *batcher)
 	check_pthread(pthread_mutex_lock(&batcher->mutex));
 	assert(batcher->remaining > 0);
 	if (--batcher->remaining == 0) {
-		// STM epoch-finalization must run here, before admitting a new batch.
+		if (batcher->finalize_epoch) {
+			batcher->finalize_epoch(batcher->finalize_context);
+		}
 		++batcher->epoch;
 		batcher->remaining = batcher->waiting;
 		batcher->waiting = 0;
