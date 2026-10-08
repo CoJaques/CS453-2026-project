@@ -34,90 +34,92 @@
 #include "types.h"
 #include "macros.h"
 
-/** Destroy a fully initialized segment with no concurrent users.
- * @param segment Segment whose buffers and controls are released
- * @param align Size of a word in the associated region
+/** Find the shared mutex protecting a word's metadata and read-write accesses.
+ * @param region Region owning the lock table
+ * @param segment Segment containing the word
+ * @param index Word index within the segment
+ * @return Stable mutex for this word, independent of its readable copy
 **/
-static void segment_destroy(segment_t *segment, size_t align)
+static pthread_mutex_t *word_mutex_for(region_t *region, segment_t *segment,
+				     size_t index)
 {
-	for (size_t i = 0; i < segment->size / align; ++i) {
-		if (pthread_mutex_destroy(&segment->status[i].mutex) != 0) {
+	uintptr_t key = (uintptr_t)segment->data[0] / region->align + index;
+	key ^= key >> 10;
+	key ^= key >> 20;
+	return &region->word_locks[key % WORD_LOCK_COUNT];
+}
+
+/** Destroy the initialized prefix of a region's word lock table.
+ * @param region Region owning the mutexes
+ * @param count Number of successfully initialized mutexes
+**/
+static void word_locks_destroy(region_t *region, size_t count)
+{
+	for (size_t i = 0; i < count; ++i) {
+		if (pthread_mutex_destroy(&region->word_locks[i]) != 0) {
 			abort();
 		}
 	}
-	free(segment->status);
-	free(segment->data[1]);
-	free(segment->data[0]);
+}
+
+/** Destroy a fully initialized segment with no concurrent users.
+ * @param segment Segment whose buffers and controls are released
+**/
+static void segment_destroy(segment_t *segment)
+{
+	// The controls and both copies are interior pointers into this allocation.
 	free(segment);
 }
 
-/** Create a zero-initialized dual-versioned segment.
+/** Create a zero-initialized dual-versioned segment in one allocation.
  * @param size Positive segment size, a multiple of align
  * @param align Positive power-of-two word size
  * @return Initialized segment, or NULL after cleanup on failure
 **/
 static segment_t *segment_create(size_t size, size_t align)
 {
+	// calloc aligns the base for both structures; round the controls' offset too.
+	size_t status_align = _Alignof(word_status_t);
+	size_t status_offset = sizeof(segment_t) +
+		(status_align - sizeof(segment_t) % status_align) % status_align;
 	size_t word_count = size / align;
-	if (word_count > SIZE_MAX / sizeof(word_status_t)) {
+	if (word_count > (SIZE_MAX - status_offset) / sizeof(word_status_t)) {
+		return NULL;
+	}
+	size_t data_offset = status_offset + word_count * sizeof(word_status_t);
+	// Reserve enough padding to align the actual data address, not just its offset.
+	if (align - 1 > SIZE_MAX - data_offset) {
+		return NULL;
+	}
+	size_t overhead = data_offset + align - 1;
+	if (size > (SIZE_MAX - overhead) / 2) {
 		return NULL;
 	}
 
-	segment_t *segment = calloc(1, sizeof(segment_t));
+	segment_t *segment = calloc(1, overhead + 2 * size);
 	if (unlikely(!segment)) {
 		return NULL;
 	}
+	unsigned char *base = (unsigned char *)segment;
+	unsigned char *data = base + data_offset;
+	size_t remainder = (uintptr_t)data % align;
+	if (remainder != 0) {
+		data += align - remainder;
+	}
 	segment->size = size;
 	segment->next = NULL;
-	size_t initialized_words = 0;
-	size_t allocation_align = align < sizeof(void *) ? sizeof(void *) :
-							   align;
-
-	for (size_t copy = 0; copy < 2; ++copy) {
-		if (posix_memalign(&segment->data[copy], allocation_align,
-				   size) != 0) {
-			goto fail;
-		}
-		memset(segment->data[copy], 0, size);
-	}
-
-	segment->status = calloc(word_count, sizeof(word_status_t));
-	if (unlikely(!segment->status)) {
-		goto fail;
-	}
-	for (size_t i = 0; i < word_count; ++i) {
-		word_status_t *status = &segment->status[i];
-		status->read_copy = 0;
-		status->written = false;
-		status->epoch = 0;
-		status->access_state = ACCESS_NONE;
-		status->owner = invalid_tx;
-		if (pthread_mutex_init(&status->mutex, NULL) != 0) {
-			goto fail;
-		}
-		++initialized_words;
-	}
+	segment->status = (word_status_t *)(base + status_offset);
+	segment->data[0] = data;
+	segment->data[1] = data + size; // size is a multiple of align.
+	// Zeroed controls mean copy 0, unwritten, epoch 0 and ACCESS_NONE.
+	// owner is ignored in ACCESS_NONE, so no per-word initialization is needed.
 	return segment;
-
-fail:
-	// Only mutexes whose initialization succeeded may be destroyed.
-	for (size_t i = 0; i < initialized_words; ++i) {
-		if (pthread_mutex_destroy(&segment->status[i].mutex) != 0) {
-			abort();
-		}
-	}
-	free(segment->status);
-	free(segment->data[1]);
-	free(segment->data[0]);
-	free(segment);
-	return NULL;
 }
 
 /** Release a context and its unpublished allocations without leaving the batch.
- * @param region Region whose alignment applies to the private segments
  * @param transaction Heap-allocated context to destroy
 **/
-static void transaction_discard(region_t *region, transaction_t *transaction)
+static void transaction_discard(transaction_t *transaction)
 {
 	// Tentative writes are never published; word access marks expire by epoch.
 	free(transaction->written_words);
@@ -129,7 +131,7 @@ static void transaction_discard(region_t *region, transaction_t *transaction)
 	while (transaction->segment_allocated) {
 		segment_ref_t *ref = transaction->segment_allocated;
 		transaction->segment_allocated = ref->next;
-		segment_destroy(ref->segment, region->align);
+		segment_destroy(ref->segment);
 		free(ref);
 	}
 	free(transaction);
@@ -141,7 +143,7 @@ static void transaction_discard(region_t *region, transaction_t *transaction)
 **/
 static void transaction_abort(region_t *region, transaction_t *transaction)
 {
-	transaction_discard(region, transaction);
+	transaction_discard(transaction);
 	batcher_leave(region->batcher);
 }
 
@@ -210,7 +212,7 @@ static void region_finalize_epoch(void *context)
 		}
 		assert(*link == ref->segment);
 		*link = ref->segment->next;
-		segment_destroy(ref->segment, region->align);
+		segment_destroy(ref->segment);
 		free(ref);
 	}
 
@@ -244,13 +246,23 @@ shared_t tm_create(size_t size, size_t align)
 	region->align = align;
 	region->committed = NULL;
 
+	for (size_t i = 0; i < WORD_LOCK_COUNT; ++i) {
+		if (pthread_mutex_init(&region->word_locks[i], NULL) != 0) {
+			word_locks_destroy(region, i);
+			free(region);
+			return invalid_shared;
+		}
+	}
+
 	batcher_t *batcher = malloc(sizeof(batcher_t));
 	if (unlikely(!batcher)) {
+		word_locks_destroy(region, WORD_LOCK_COUNT);
 		free(region);
 		return invalid_shared;
 	}
 	if (unlikely(!batcher_init(batcher, region_finalize_epoch, region))) {
 		free(batcher);
+		word_locks_destroy(region, WORD_LOCK_COUNT);
 		free(region);
 		return invalid_shared;
 	}
@@ -262,6 +274,7 @@ shared_t tm_create(size_t size, size_t align)
 	if (unlikely(!initial_segment)) {
 		batcher_destroy(batcher);
 		free(batcher);
+		word_locks_destroy(region, WORD_LOCK_COUNT);
 		free(region);
 		return invalid_shared;
 	}
@@ -286,18 +299,19 @@ void tm_destroy(shared_t unused(shared))
 	while (region->committed) {
 		transaction_t *transaction = region->committed;
 		region->committed = transaction->next_committed;
-		transaction_discard(region, transaction);
+		transaction_discard(transaction);
 	}
 	segment_t *current = region->head;
 
 	while (current) {
 		segment_t *next = current->next;
-		segment_destroy(current, region->align);
+		segment_destroy(current);
 		current = next;
 	}
 
 	batcher_destroy(region->batcher);
 	free(region->batcher);
+	word_locks_destroy(region, WORD_LOCK_COUNT);
 	free(region);
 
 	return;
@@ -408,7 +422,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 	transaction_t *transaction = (transaction_t *)tx;
 	region_t *region = (region_t *)shared;
 	assert((uintptr_t)source % region->align == 0);
-	assert((uintptr_t)target % region->align == 0);
+	// The private destination may be unaligned; memcpy handles byte buffers.
 	uintptr_t address = (uintptr_t)source;
 	segment_t *segment = NULL;
 
@@ -452,7 +466,8 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 		size_t word_offset = offset + done;
 		size_t index = word_offset / region->align;
 		word_status_t *status = &segment->status[index];
-		if (pthread_mutex_lock(&status->mutex) != 0) {
+		pthread_mutex_t *mutex = word_mutex_for(region, segment, index);
+		if (pthread_mutex_lock(mutex) != 0) {
 			abort();
 		}
 		if (status->epoch != transaction->epoch) {
@@ -469,7 +484,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 			if (status->access_state != ACCESS_ONE ||
 			    status->owner != transaction->id) {
 				// Abort may destroy private segments, so release the word first.
-				if (pthread_mutex_unlock(&status->mutex) != 0) {
+				if (pthread_mutex_unlock(mutex) != 0) {
 					abort();
 				}
 				transaction_abort(region, transaction);
@@ -488,7 +503,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 		memcpy((unsigned char *)target + done,
 		       (unsigned char *)segment->data[copy] + word_offset,
 		       region->align);
-		if (pthread_mutex_unlock(&status->mutex) != 0) {
+		if (pthread_mutex_unlock(mutex) != 0) {
 			abort();
 		}
 	}
@@ -543,8 +558,8 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 
 	transaction_t *transaction = (transaction_t *)tx;
 	region_t *region = (region_t *)shared;
-	assert((uintptr_t)source % region->align == 0);
 	assert((uintptr_t)target % region->align == 0);
+	// The private source may be unaligned; memcpy handles byte buffers.
 	assert(!transaction->is_ro);
 	uintptr_t address = (uintptr_t)target;
 	segment_t *segment = NULL;
@@ -573,7 +588,8 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 		size_t word_offset = offset + done;
 		size_t index = word_offset / region->align;
 		word_status_t *status = &segment->status[index];
-		if (pthread_mutex_lock(&status->mutex) != 0) {
+		pthread_mutex_t *mutex = word_mutex_for(region, segment, index);
+		if (pthread_mutex_lock(mutex) != 0) {
 			abort();
 		}
 		if (status->epoch != transaction->epoch) {
@@ -595,7 +611,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 		}
 
 		if (!authorized) {
-			if (pthread_mutex_unlock(&status->mutex) != 0) {
+			if (pthread_mutex_unlock(mutex) != 0) {
 				abort();
 			}
 			transaction_abort(shared, transaction);
@@ -606,7 +622,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 			bool success = transaction_record_write(transaction,
 								segment, index);
 			if (!success) {
-				if (pthread_mutex_unlock(&status->mutex) != 0) {
+				if (pthread_mutex_unlock(mutex) != 0) {
 					abort();
 				}
 				transaction_abort(shared, transaction);
@@ -622,7 +638,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 		status->owner = transaction->id;
 		status->written = true;
 
-		if (pthread_mutex_unlock(&status->mutex) != 0) {
+		if (pthread_mutex_unlock(mutex) != 0) {
 			abort();
 		}
 	}
@@ -657,7 +673,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
 	segment_ref_t *segment_ref = malloc(sizeof(segment_ref_t));
 
 	if (unlikely(!segment_ref)) {
-		segment_destroy(segment, region->align);
+		segment_destroy(segment);
 		return nomem_alloc;
 	}
 
