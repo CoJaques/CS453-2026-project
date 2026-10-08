@@ -20,6 +20,7 @@
 #endif
 
 // Requested features
+#include <assert.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
@@ -68,10 +69,12 @@ static segment_t *segment_create(size_t size, size_t align)
 	segment->size = size;
 	segment->next = NULL;
 	size_t initialized_words = 0;
-	size_t allocation_align = align < sizeof(void *) ? sizeof(void *) : align;
+	size_t allocation_align = align < sizeof(void *) ? sizeof(void *) :
+							   align;
 
 	for (size_t copy = 0; copy < 2; ++copy) {
-		if (posix_memalign(&segment->data[copy], allocation_align, size) != 0) {
+		if (posix_memalign(&segment->data[copy], allocation_align,
+				   size) != 0) {
 			goto fail;
 		}
 		memset(segment->data[copy], 0, size);
@@ -107,6 +110,29 @@ fail:
 	free(segment->data[0]);
 	free(segment);
 	return NULL;
+}
+
+/** Abandon a transaction and leave its batch after releasing private resources.
+ * @param region Region in whose batch the transaction participates
+ * @param transaction Heap-allocated context to destroy
+**/
+static void transaction_abort(region_t *region, transaction_t *transaction)
+{
+	// Tentative writes are never published; word access marks expire by epoch.
+	free(transaction->written_words);
+	while (transaction->segment_to_free) {
+		segment_ref_t *ref = transaction->segment_to_free;
+		transaction->segment_to_free = ref->next;
+		free(ref);
+	}
+	while (transaction->segment_allocated) {
+		segment_ref_t *ref = transaction->segment_allocated;
+		transaction->segment_allocated = ref->next;
+		segment_destroy(ref->segment, region->align);
+		free(ref);
+	}
+	free(transaction);
+	batcher_leave(region->batcher);
 }
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
@@ -276,9 +302,35 @@ bool tm_write(shared_t unused(shared), tx_t unused(tx),
 **/
 alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
 {
+	// Invalid arguments violate the API contract; they are not transaction aborts.
+	assert(shared != invalid_shared && target != NULL);
+	assert(tx != 0 && tx != invalid_tx);
 	region_t *region = (region_t *)shared;
+	assert(size > 0 && size % region->align == 0);
 
-	return abort_alloc;
+	transaction_t *transaction = (transaction_t *)tx;
+	assert(!transaction->is_ro);
+
+	segment_t *segment = segment_create(size, region->align);
+
+	if (unlikely(!segment)) {
+		return nomem_alloc;
+	}
+
+	segment_ref_t *segment_ref = malloc(sizeof(segment_ref_t));
+
+	if (unlikely(!segment_ref)) {
+		segment_destroy(segment, region->align);
+		return nomem_alloc;
+	}
+
+	segment_ref->segment = segment;
+
+	segment_ref->next = transaction->segment_allocated;
+	transaction->segment_allocated = segment_ref;
+
+	*target = segment->data[0];
+	return success_alloc;
 }
 
 /** [thread-safe] Memory freeing in the given transaction.
@@ -287,8 +339,54 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
  * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
 **/
-bool tm_free(shared_t unused(shared), tx_t unused(tx), void *unused(target))
+bool tm_free(shared_t shared, tx_t tx, void *target)
 {
-	// TODO: tm_free(shared_t, tx_t, void*)
-	return false;
+	assert(shared != invalid_shared && target != NULL);
+	assert(tx != 0 && tx != invalid_tx);
+	region_t *region = (region_t *)shared;
+	transaction_t *transaction = (transaction_t *)tx;
+	assert(!transaction->is_ro);
+	assert(target != region->head->data[0]);
+
+	// One request per segment prevents duplicate destruction in this transaction.
+	for (segment_ref_t *ref = transaction->segment_to_free; ref;
+	     ref = ref->next) {
+		if (ref->segment->data[0] == target) {
+			return true;
+		}
+	}
+
+	segment_t *segment = NULL;
+	for (segment_ref_t *ref = transaction->segment_allocated; ref;
+	     ref = ref->next) {
+		if (ref->segment->data[0] == target) {
+			segment = ref->segment;
+			break;
+		}
+	}
+
+	if (!segment) {
+		// Publish allocations and unlink freed segments only between epochs.
+		// This keeps the region's segment list stable while transactions use it.
+		for (segment = region->head->next; segment;
+		     segment = segment->next) {
+			if (segment->data[0] == target) {
+				break;
+			}
+		}
+	}
+	// Only the public base address of a live, accessible segment is valid.
+	assert(segment != NULL);
+
+	segment_ref_t *ref = malloc(sizeof(segment_ref_t));
+	if (unlikely(!ref)) {
+		// Unlike tm_alloc, this API has no non-aborting out-of-memory result.
+		transaction_abort(region, transaction);
+		return false;
+	}
+
+	ref->segment = segment;
+	ref->next = transaction->segment_to_free;
+	transaction->segment_to_free = ref;
+	return true;
 }

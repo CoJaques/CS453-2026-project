@@ -23,8 +23,29 @@ typedef struct segment_t {
 } segment_t;
 
 typedef struct {
+	segment_t *segment;
+	size_t index; // Word index within the segment, not a byte offset.
+} word_ref_t;
+
+typedef struct segment_ref_t {
+	segment_t *segment;
+	struct segment_ref_t *next; // Independent of the region's segment list.
+} segment_ref_t;
+
+typedef struct {
 	size_t size;
 	size_t align;
 	batcher_t *batcher;
 	segment_t *head;
 } region_t;
+
+typedef struct {
+	tx_t id;
+	bool is_ro;
+	uint64_t epoch;
+	word_ref_t *written_words; // One entry per distinct word written.
+	size_t written_count;
+	size_t written_capacity;
+	segment_ref_t *segment_allocated;
+	segment_ref_t *segment_to_free;
+} transaction_t;
