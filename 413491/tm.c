@@ -33,6 +33,7 @@
 
 #include "types.h"
 #include "macros.h"
+#include "sync.h"
 
 /** Find the shared mutex protecting a word's metadata and read-write accesses.
  * @param region Region owning the lock table
@@ -43,10 +44,25 @@
 static pthread_mutex_t *word_mutex_for(region_t *region, segment_t *segment,
 				     size_t index)
 {
-	uintptr_t key = ((uintptr_t)segment->data[0] >> region->align_shift) + index;
+	uintptr_t key = ((uintptr_t)segment->data[DATA_COMMITTED] >>
+			 region->align_shift) + index;
 	key ^= key >> 10;
 	key ^= key >> 20;
 	return &region->word_locks[key % WORD_LOCK_COUNT];
+}
+
+/** Reset obsolete word access metadata while its mutex is held by the caller.
+ * @param status Word control protected by the acquired mutex
+ * @param epoch Epoch of the transaction accessing the word
+**/
+static inline void word_prepare_epoch(word_status_t *status, uint64_t epoch)
+{
+	if (status->epoch != epoch) {
+		status->epoch = epoch;
+		status->written = false;
+		status->access_state = ACCESS_NONE;
+		status->owner = invalid_tx;
+	}
 }
 
 /** Destroy the initialized prefix of a region's word lock table.
@@ -56,9 +72,7 @@ static pthread_mutex_t *word_mutex_for(region_t *region, segment_t *segment,
 static void word_locks_destroy(region_t *region, size_t count)
 {
 	for (size_t i = 0; i < count; ++i) {
-		if (pthread_mutex_destroy(&region->word_locks[i]) != 0) {
-			abort();
-		}
+		check_pthread(pthread_mutex_destroy(&region->word_locks[i]));
 	}
 }
 
@@ -111,11 +125,38 @@ static segment_t *segment_create(size_t size, size_t align,
 	segment->size = size;
 	segment->next = NULL;
 	segment->status = (word_status_t *)(base + status_offset);
-	segment->data[0] = data;
-	segment->data[1] = data + size; // size is a multiple of align.
+	segment->data[DATA_COMMITTED] = data;
+	segment->data[DATA_PENDING] = data + size; // size is a multiple of align.
 	// Zeroed controls mean unwritten, epoch 0 and ACCESS_NONE.
 	// owner is ignored in ACCESS_NONE, so no per-word initialization is needed.
 	return segment;
+}
+
+/** Find a segment containing a public address in an active transaction's epoch.
+ * @param region Region whose published segment list stays stable within the epoch
+ * @param transaction Transaction whose private allocations are searched first
+ * @param address Public base or interior address to locate
+ * @return Accessible segment containing the address, or NULL if none matches
+**/
+static segment_t *transaction_find_segment(const region_t *region,
+					   const transaction_t *transaction,
+					   const void *address)
+{
+	uintptr_t target = (uintptr_t)address;
+	for (const segment_ref_t *ref = transaction->segment_allocated; ref;
+	     ref = ref->next) {
+		uintptr_t base = (uintptr_t)ref->segment->data[DATA_COMMITTED];
+		if (target >= base && target - base < ref->segment->size) {
+			return ref->segment;
+		}
+	}
+	for (segment_t *segment = region->head; segment; segment = segment->next) {
+		uintptr_t base = (uintptr_t)segment->data[DATA_COMMITTED];
+		if (target >= base && target - base < segment->size) {
+			return segment;
+		}
+	}
+	return NULL;
 }
 
 /** Release a context and its unpublished allocations without leaving the batch.
@@ -168,8 +209,10 @@ static void region_finalize_epoch(void *context)
 		for (size_t i = 0; i < tx->written_count; ++i) {
 			word_ref_t word = tx->written_words[i];
 			size_t offset = word.index << region->align_shift;
-			memcpy((unsigned char *)word.segment->data[0] + offset,
-			       (unsigned char *)word.segment->data[1] + offset,
+			memcpy((unsigned char *)word.segment->data[DATA_COMMITTED] +
+				       offset,
+			       (unsigned char *)word.segment->data[DATA_PENDING] +
+				       offset,
 			       region->align);
 		}
 	}
@@ -331,7 +374,7 @@ void *tm_start(shared_t shared)
 {
 	region_t *region = (region_t *)shared;
 	// Public addresses always point into the committed snapshot.
-	return region->head->data[0];
+	return region->head->data[DATA_COMMITTED];
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
@@ -397,14 +440,10 @@ bool tm_end(shared_t shared, tx_t tx)
 	}
 
 	// Retain the context and its logs until publication at the epoch boundary.
-	if (pthread_mutex_lock(&region->batcher->mutex) != 0) {
-		abort();
-	}
+	check_pthread(pthread_mutex_lock(&region->batcher->mutex));
 	transaction->next_committed = region->committed;
 	region->committed = transaction;
-	if (pthread_mutex_unlock(&region->batcher->mutex) != 0) {
-		abort();
-	}
+	check_pthread(pthread_mutex_unlock(&region->batcher->mutex));
 
 	batcher_leave(region->batcher);
 	return true;
@@ -429,34 +468,15 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 	assert(size > 0 && (size & (region->align - 1)) == 0);
 	assert(((uintptr_t)source & (region->align - 1)) == 0);
 	if (transaction->is_ro) {
-		// Valid public addresses refer to data[0], stable until this batch ends.
+		// Public addresses refer to DATA_COMMITTED, stable until this batch ends.
 		// memcpy also accepts an unaligned private destination.
 		memcpy(target, source, size);
 		return true;
 	}
 
-	uintptr_t address = (uintptr_t)source;
-	segment_t *segment = NULL;
-
-	for (segment_ref_t *ref = transaction->segment_allocated; ref;
-	     ref = ref->next) {
-		uintptr_t base = (uintptr_t)ref->segment->data[0];
-		if (address >= base && address - base < ref->segment->size) {
-			segment = ref->segment;
-			break;
-		}
-	}
-	if (!segment) {
-		// The published list stays stable throughout the current epoch.
-		for (segment = region->head; segment; segment = segment->next) {
-			uintptr_t base = (uintptr_t)segment->data[0];
-			if (address >= base && address - base < segment->size) {
-				break;
-			}
-		}
-	}
+	segment_t *segment = transaction_find_segment(region, transaction, source);
 	assert(segment != NULL);
-	size_t offset = address - (uintptr_t)segment->data[0];
+	size_t offset = (uintptr_t)source - (uintptr_t)segment->data[DATA_COMMITTED];
 	assert(size <= segment->size - offset);
 
 	for (size_t done = 0; done < size; done += region->align) {
@@ -464,24 +484,14 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 		size_t index = word_offset >> region->align_shift;
 		word_status_t *status = &segment->status[index];
 		pthread_mutex_t *mutex = word_mutex_for(region, segment, index);
-		if (pthread_mutex_lock(mutex) != 0) {
-			abort();
-		}
-		if (status->epoch != transaction->epoch) {
-			// The published copy persists; only access metadata expires.
-			status->epoch = transaction->epoch;
-			status->written = false;
-			status->access_state = ACCESS_NONE;
-			status->owner = invalid_tx;
-		}
+		check_pthread(pthread_mutex_lock(mutex));
+		word_prepare_epoch(status, transaction->epoch);
 
 		if (status->written) {
 			if (status->access_state != ACCESS_ONE ||
 			    status->owner != transaction->id) {
 				// Abort may destroy private segments, so release the word first.
-				if (pthread_mutex_unlock(mutex) != 0) {
-					abort();
-				}
+				check_pthread(pthread_mutex_unlock(mutex));
 				transaction_abort(region, transaction);
 				return false;
 			}
@@ -494,13 +504,11 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 			status->owner = invalid_tx;
 		}
 
+		unsigned int buffer = status->written ? DATA_PENDING : DATA_COMMITTED;
 		memcpy((unsigned char *)target + done,
-		       (unsigned char *)segment->data[status->written ? 1 : 0] +
-			       word_offset,
+		       (unsigned char *)segment->data[buffer] + word_offset,
 		       region->align);
-		if (pthread_mutex_unlock(mutex) != 0) {
-			abort();
-		}
+		check_pthread(pthread_mutex_unlock(mutex));
 	}
 	return true;
 }
@@ -556,27 +564,9 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 	assert(((uintptr_t)target & (region->align - 1)) == 0);
 	// The private source may be unaligned; memcpy handles byte buffers.
 	assert(!transaction->is_ro);
-	uintptr_t address = (uintptr_t)target;
-	segment_t *segment = NULL;
-	for (segment_ref_t *ref = transaction->segment_allocated; ref;
-	     ref = ref->next) {
-		uintptr_t base = (uintptr_t)ref->segment->data[0];
-		if (address >= base && address - base < ref->segment->size) {
-			segment = ref->segment;
-			break;
-		}
-	}
-	if (!segment) {
-		// The published list stays stable throughout the current epoch.
-		for (segment = region->head; segment; segment = segment->next) {
-			uintptr_t base = (uintptr_t)segment->data[0];
-			if (address >= base && address - base < segment->size) {
-				break;
-			}
-		}
-	}
+	segment_t *segment = transaction_find_segment(region, transaction, target);
 	assert(segment != NULL);
-	size_t offset = address - (uintptr_t)segment->data[0];
+	size_t offset = (uintptr_t)target - (uintptr_t)segment->data[DATA_COMMITTED];
 	assert(size <= segment->size - offset);
 
 	for (size_t done = 0; done < size; done += region->align) {
@@ -584,16 +574,8 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 		size_t index = word_offset >> region->align_shift;
 		word_status_t *status = &segment->status[index];
 		pthread_mutex_t *mutex = word_mutex_for(region, segment, index);
-		if (pthread_mutex_lock(mutex) != 0) {
-			abort();
-		}
-		if (status->epoch != transaction->epoch) {
-			// The published copy persists; only access metadata expires.
-			status->epoch = transaction->epoch;
-			status->written = false;
-			status->access_state = ACCESS_NONE;
-			status->owner = invalid_tx;
-		}
+		check_pthread(pthread_mutex_lock(mutex));
+		word_prepare_epoch(status, transaction->epoch);
 
 		bool authorized = false;
 		if (status->written) {
@@ -606,9 +588,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 		}
 
 		if (!authorized) {
-			if (pthread_mutex_unlock(mutex) != 0) {
-				abort();
-			}
+			check_pthread(pthread_mutex_unlock(mutex));
 			transaction_abort(shared, transaction);
 			return false;
 		}
@@ -617,23 +597,19 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 			bool success = transaction_record_write(transaction,
 								segment, index);
 			if (!success) {
-				if (pthread_mutex_unlock(mutex) != 0) {
-					abort();
-				}
+				check_pthread(pthread_mutex_unlock(mutex));
 				transaction_abort(shared, transaction);
 				return false;
 			}
 		}
 
-		memcpy((unsigned char *)segment->data[1] + word_offset,
+		memcpy((unsigned char *)segment->data[DATA_PENDING] + word_offset,
 		       (unsigned char const *)source + done, region->align);
 		status->access_state = ACCESS_ONE;
 		status->owner = transaction->id;
 		status->written = true;
 
-		if (pthread_mutex_unlock(mutex) != 0) {
-			abort();
-		}
+		check_pthread(pthread_mutex_unlock(mutex));
 	}
 
 	return true;
@@ -675,7 +651,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
 	segment_ref->next = transaction->segment_allocated;
 	transaction->segment_allocated = segment_ref;
 
-	*target = segment->data[0];
+	*target = segment->data[DATA_COMMITTED];
 	return success_alloc;
 }
 
@@ -692,37 +668,19 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
 	region_t *region = (region_t *)shared;
 	transaction_t *transaction = (transaction_t *)tx;
 	assert(!transaction->is_ro);
-	assert(target != region->head->data[0]);
+	assert(target != region->head->data[DATA_COMMITTED]);
 
 	// One request per segment prevents duplicate destruction in this transaction.
 	for (segment_ref_t *ref = transaction->segment_to_free; ref;
 	     ref = ref->next) {
-		if (ref->segment->data[0] == target) {
+		if (ref->segment->data[DATA_COMMITTED] == target) {
 			return true;
 		}
 	}
 
-	segment_t *segment = NULL;
-	for (segment_ref_t *ref = transaction->segment_allocated; ref;
-	     ref = ref->next) {
-		if (ref->segment->data[0] == target) {
-			segment = ref->segment;
-			break;
-		}
-	}
-
-	if (!segment) {
-		// Publish allocations and unlink freed segments only between epochs.
-		// This keeps the region's segment list stable while transactions use it.
-		for (segment = region->head->next; segment;
-		     segment = segment->next) {
-			if (segment->data[0] == target) {
-				break;
-			}
-		}
-	}
+	segment_t *segment = transaction_find_segment(region, transaction, target);
 	// Only the public base address of a live, accessible segment is valid.
-	assert(segment != NULL);
+	assert(segment != NULL && segment->data[DATA_COMMITTED] == target);
 
 	segment_ref_t *ref = malloc(sizeof(segment_ref_t));
 	if (unlikely(!ref)) {

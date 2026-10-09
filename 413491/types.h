@@ -5,6 +5,7 @@
 #include <stdbool.h>
 
 typedef enum { ACCESS_NONE = 0, ACCESS_ONE, ACCESS_MANY } access_state_t;
+enum { DATA_COMMITTED = 0, DATA_PENDING = 1 };
 enum { WORD_LOCK_COUNT = 1024 };
 
 typedef struct {
@@ -16,7 +17,7 @@ typedef struct {
 
 typedef struct segment_t {
 	size_t size;
-	// Interior pointers: data[0] is committed, data[1] holds provisional writes.
+	// Interior pointers: DATA_COMMITTED is the snapshot, DATA_PENDING holds writes.
 	void *data[2];
 	word_status_t *status; // Interior array of size / region->align controls.
 	struct segment_t *next;

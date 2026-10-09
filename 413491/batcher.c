@@ -1,17 +1,7 @@
 #include "batcher.h"
+#include "sync.h"
 
 #include <assert.h>
-#include <stdlib.h>
-
-/** Abort on a synchronization failure to avoid corrupting the batch state.
- * @param error Return code from a pthread operation
-**/
-static void check_pthread(int error)
-{
-	if (error != 0) {
-		abort();
-	}
-}
 
 bool batcher_init(batcher_t *batcher, batcher_finalize_fn finalize_epoch,
 		  void *context)
