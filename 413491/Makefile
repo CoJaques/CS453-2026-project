@@ -24,10 +24,6 @@ LD       := $(if $(SRCS_CXX),$(CXX),$(CC))
 LDFLAGS  := -shared
 LDLIBS   := -pthread
 
-ifeq ($(BATCHER_STATS),1)
-CPPFLAGS += -DBATCHER_STATS
-endif
-
 .PHONY: build clean
 
 build: $(BIN)

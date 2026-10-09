@@ -78,7 +78,6 @@ static void transaction_discard(transaction_t *transaction)
 static void transaction_abort(region_t *region, transaction_t *transaction)
 {
 	transaction_discard(transaction);
-	batcher_lock_for_leave(region->batcher);
 	batcher_leave(region->batcher);
 }
 
@@ -328,18 +327,17 @@ bool tm_end(shared_t shared, tx_t tx)
 
 	if (transaction->is_ro) {
 		free(transaction);
-		batcher_lock_for_leave(region->batcher);
 		batcher_leave(region->batcher);
 		return true;
 	}
 
 	// Retain the context and its logs until publication at the epoch boundary.
-	// The mutex is unlocked on the batcher_leave call
+	// Registration and departure share one acquisition of the mutex.
 	batcher_lock_for_leave(region->batcher);
 	transaction->next_committed = region->committed;
 	region->committed = transaction;
 
-	batcher_leave(region->batcher);
+	batcher_leave_locked(region->batcher);
 	return true;
 }
 
