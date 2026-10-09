@@ -77,8 +77,12 @@ static void transaction_discard(transaction_t *transaction)
 **/
 static void transaction_abort(region_t *region, transaction_t *transaction)
 {
+	assert(!transaction->is_ro);
+	batcher_lock_for_leave(region->batcher);
+	// Close before freeing the context: its address remains a word owner this epoch.
+	region->batcher->closed_rw = true;
 	transaction_discard(transaction);
-	batcher_leave(region->batcher);
+	batcher_leave_locked(region->batcher);
 }
 
 /** Publish committed effects before the next batch starts running.
@@ -308,7 +312,7 @@ tx_t tm_begin(shared_t shared, bool is_ro)
 	transaction->id = (tx_t)transaction;
 	transaction->is_ro = is_ro;
 
-	transaction->epoch = batcher_enter(region->batcher);
+	transaction->epoch = batcher_enter(region->batcher, is_ro);
 
 	return (tx_t)transaction;
 }
@@ -334,6 +338,7 @@ bool tm_end(shared_t shared, tx_t tx)
 	// Retain the context and its logs until publication at the epoch boundary.
 	// Registration and departure share one acquisition of the mutex.
 	batcher_lock_for_leave(region->batcher);
+	region->batcher->closed_ro = true;
 	transaction->next_committed = region->committed;
 	region->committed = transaction;
 

@@ -21,6 +21,8 @@ bool batcher_init(batcher_t *batcher, batcher_finalize_fn finalize_epoch,
 	batcher->waiting = 0;
 	batcher->finalize_epoch = finalize_epoch;
 	batcher->finalize_context = context;
+	batcher->closed_ro = false;
+	batcher->closed_rw = false;
 	return true;
 }
 
@@ -41,7 +43,8 @@ static void batcher_wait(batcher_t *batcher, uint32_t notification)
 	while (atomic_load_explicit(&batcher->changed, memory_order_acquire) ==
 	       notification) {
 		long result = syscall(SYS_futex, &batcher->changed,
-				      FUTEX_WAIT_PRIVATE, notification, NULL, NULL, 0);
+				      FUTEX_WAIT_PRIVATE, notification, NULL,
+				      NULL, 0);
 		if (result < 0 && errno != EAGAIN && errno != EINTR) {
 			abort();
 		}
@@ -53,24 +56,25 @@ static void batcher_wait(batcher_t *batcher, uint32_t notification)
 **/
 static void batcher_wake_all(batcher_t *batcher)
 {
-	if (syscall(SYS_futex, &batcher->changed, FUTEX_WAKE_PRIVATE,
-		    INT_MAX, NULL, NULL, 0) < 0) {
+	if (syscall(SYS_futex, &batcher->changed, FUTEX_WAKE_PRIVATE, INT_MAX,
+		    NULL, NULL, 0) < 0) {
 		abort();
 	}
 }
 
-uint64_t batcher_enter(batcher_t *batcher)
+uint64_t batcher_enter(batcher_t *batcher, bool is_ro)
 {
 	check_pthread(pthread_mutex_lock(&batcher->mutex));
 
 	uint64_t epoch = batcher->epoch;
-	bool queued = batcher->remaining != 0;
+	bool queued = is_ro ? batcher->closed_ro : batcher->closed_rw;
 	uint32_t notification =
 		atomic_load_explicit(&batcher->changed, memory_order_relaxed);
-	if (!queued) {
-		batcher->remaining = 1;
-	} else {
+
+	if (queued) {
 		++batcher->waiting;
+	} else {
+		++batcher->remaining;
 	}
 	check_pthread(pthread_mutex_unlock(&batcher->mutex));
 
@@ -80,12 +84,14 @@ uint64_t batcher_enter(batcher_t *batcher)
 		batcher_wait(batcher, notification);
 		++epoch;
 	}
+
 	return epoch;
 }
 
 void batcher_leave_locked(batcher_t *batcher)
 {
 	assert(batcher->remaining > 0);
+
 	if (--batcher->remaining == 0) {
 		// No arrival can observe zero until publication completes: we hold mutex.
 		if (batcher->finalize_epoch) {
@@ -96,8 +102,11 @@ void batcher_leave_locked(batcher_t *batcher)
 		batcher->remaining = next_size;
 		batcher->waiting = 0;
 		++batcher->epoch;
+		batcher->closed_ro = false;
+		batcher->closed_rw = false;
 		// Publish writes and the next participant count before admitting waiters.
-		atomic_store_explicit(&batcher->changed, (uint32_t)batcher->epoch,
+		atomic_store_explicit(&batcher->changed,
+				      (uint32_t)batcher->epoch,
 				      memory_order_release);
 		if (next_size) {
 			batcher_wake_all(batcher);
