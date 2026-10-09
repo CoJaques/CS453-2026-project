@@ -38,7 +38,7 @@
  * @param region Region owning the lock table
  * @param segment Segment containing the word
  * @param index Word index within the segment
- * @return Stable mutex for this word, independent of its readable copy
+ * @return Stable mutex for this word's read-write accesses
 **/
 static pthread_mutex_t *word_mutex_for(region_t *region, segment_t *segment,
 				     size_t index)
@@ -113,7 +113,7 @@ static segment_t *segment_create(size_t size, size_t align,
 	segment->status = (word_status_t *)(base + status_offset);
 	segment->data[0] = data;
 	segment->data[1] = data + size; // size is a multiple of align.
-	// Zeroed controls mean copy 0, unwritten, epoch 0 and ACCESS_NONE.
+	// Zeroed controls mean unwritten, epoch 0 and ACCESS_NONE.
 	// owner is ignored in ACCESS_NONE, so no per-word initialization is needed.
 	return segment;
 }
@@ -162,15 +162,15 @@ static void region_finalize_epoch(void *context)
 	transaction_t *committed = region->committed;
 	region->committed = NULL;
 
-	// Publish all written words while every referenced segment is still alive.
+	// Copy committed words into the snapshot before any segment can be destroyed.
 	for (transaction_t *tx = committed; tx; tx = tx->next_committed) {
 		assert(tx->epoch == region->batcher->epoch);
 		for (size_t i = 0; i < tx->written_count; ++i) {
 			word_ref_t word = tx->written_words[i];
-			word_status_t *status =
-				&word.segment->status[word.index];
-			assert(status->read_copy < 2);
-			status->read_copy = 1 - status->read_copy;
+			size_t offset = word.index << region->align_shift;
+			memcpy((unsigned char *)word.segment->data[0] + offset,
+			       (unsigned char *)word.segment->data[1] + offset,
+			       region->align);
 		}
 	}
 
@@ -330,7 +330,7 @@ void tm_destroy(shared_t unused(shared))
 void *tm_start(shared_t shared)
 {
 	region_t *region = (region_t *)shared;
-	// The public address is stable even when a word's readable copy changes.
+	// Public addresses always point into the committed snapshot.
 	return region->head->data[0];
 }
 
@@ -428,7 +428,13 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 	region_t *region = (region_t *)shared;
 	assert(size > 0 && (size & (region->align - 1)) == 0);
 	assert(((uintptr_t)source & (region->align - 1)) == 0);
-	// The private destination may be unaligned; memcpy handles byte buffers.
+	if (transaction->is_ro) {
+		// Valid public addresses refer to data[0], stable until this batch ends.
+		// memcpy also accepts an unaligned private destination.
+		memcpy(target, source, size);
+		return true;
+	}
+
 	uintptr_t address = (uintptr_t)source;
 	segment_t *segment = NULL;
 
@@ -453,21 +459,6 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 	size_t offset = address - (uintptr_t)segment->data[0];
 	assert(size <= segment->size - offset);
 
-	if (transaction->is_ro) {
-		// Readable copies and their selectors remain stable within this epoch.
-		for (size_t done = 0; done < size; done += region->align) {
-			size_t word_offset = offset + done;
-			size_t index = word_offset >> region->align_shift;
-			uint8_t copy = segment->status[index].read_copy;
-			assert(copy < 2);
-			memcpy((unsigned char *)target + done,
-			       (unsigned char *)segment->data[copy] +
-				       word_offset,
-			       region->align);
-		}
-		return true;
-	}
-
 	for (size_t done = 0; done < size; done += region->align) {
 		size_t word_offset = offset + done;
 		size_t index = word_offset >> region->align_shift;
@@ -484,8 +475,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 			status->owner = invalid_tx;
 		}
 
-		uint8_t copy = status->read_copy;
-		assert(copy < 2);
+		unsigned int copy = 0;
 		if (status->written) {
 			if (status->access_state != ACCESS_ONE ||
 			    status->owner != transaction->id) {
@@ -496,7 +486,6 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 				transaction_abort(region, transaction);
 				return false;
 			}
-			copy = 1 - copy;
 		} else if (status->access_state == ACCESS_NONE) {
 			status->access_state = ACCESS_ONE;
 			status->owner = transaction->id;
@@ -507,7 +496,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 		}
 
 		memcpy((unsigned char *)target + done,
-		       (unsigned char *)segment->data[copy] + word_offset,
+		       (unsigned char *)segment->data[1] + word_offset,
 		       region->align);
 		if (pthread_mutex_unlock(mutex) != 0) {
 			abort();
@@ -636,9 +625,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 			}
 		}
 
-		uint8_t write = 1 - status->read_copy;
-
-		memcpy((unsigned char *)segment->data[write] + word_offset,
+		memcpy((unsigned char *)segment->data[1] + word_offset,
 		       (unsigned char const *)source + done, region->align);
 		status->access_state = ACCESS_ONE;
 		status->owner = transaction->id;

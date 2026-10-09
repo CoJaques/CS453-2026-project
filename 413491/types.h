@@ -11,13 +11,13 @@ typedef struct {
 	uint64_t epoch; // Epoch of the access and write metadata.
 	tx_t owner; // Meaningful only when access_state is ACCESS_ONE.
 	access_state_t access_state; // Read-write transactions only.
-	uint8_t read_copy; // Index of the readable copy: 0 or 1.
 	bool written; // Whether the word was written during epoch.
 } word_status_t;
 
 typedef struct segment_t {
 	size_t size;
-	void *data[2]; // Interior pointers into the segment's single allocation.
+	// Interior pointers: data[0] is committed, data[1] holds provisional writes.
+	void *data[2];
 	word_status_t *status; // Interior array of size / region->align controls.
 	struct segment_t *next;
 } segment_t;
