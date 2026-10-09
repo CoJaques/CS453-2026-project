@@ -8,11 +8,12 @@
  * @param index Word index within the segment
  * @return Stable mutex for this word's read-write accesses
 **/
-static inline pthread_mutex_t *word_mutex_for(region_t *region, segment_t *segment,
-					    size_t index)
+static inline pthread_mutex_t *word_mutex_for(region_t *region,
+					      segment_t *segment, size_t index)
 {
 	uintptr_t key = ((uintptr_t)segment->data[DATA_COMMITTED] >>
-			 region->align_shift) + index;
+			 region->align_shift) +
+			index;
 	key ^= key >> 10;
 	key ^= key >> 20;
 	return &region->word_locks[key % WORD_LOCK_COUNT];

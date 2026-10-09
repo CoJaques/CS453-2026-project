@@ -38,11 +38,14 @@ typedef struct transaction_t transaction_t;
 typedef struct {
 	size_t size;
 	size_t align;
-	unsigned int align_shift; // log2(align), computed once at region creation.
+	unsigned int
+		align_shift; // log2(align), computed once at region creation.
 	batcher_t *batcher;
 	segment_t *head;
-	transaction_t *committed; // Protected by batcher->mutex; drain at epoch end.
-	pthread_mutex_t word_locks[WORD_LOCK_COUNT]; // Protect word accesses, not whole transactions.
+	transaction_t
+		*committed; // Protected by batcher->mutex; drain at epoch end.
+	pthread_mutex_t word_locks
+		[WORD_LOCK_COUNT]; // Protect word accesses, not whole transactions.
 } region_t;
 
 struct transaction_t {

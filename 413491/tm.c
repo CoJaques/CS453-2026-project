@@ -100,7 +100,8 @@ static void region_finalize_epoch(void *context)
 		for (size_t i = 0; i < tx->written_count; ++i) {
 			word_ref_t word = tx->written_words[i];
 			size_t offset = word.index << region->align_shift;
-			memcpy((unsigned char *)word.segment->data[DATA_COMMITTED] +
+			memcpy((unsigned char *)word.segment
+					       ->data[DATA_COMMITTED] +
 				       offset,
 			       (unsigned char *)word.segment->data[DATA_PENDING] +
 				       offset,
@@ -209,7 +210,8 @@ shared_t tm_create(size_t size, size_t align)
 
 	region->batcher = batcher;
 
-	segment_t *initial_segment = segment_create(size, align, region->align_shift);
+	segment_t *initial_segment =
+		segment_create(size, align, region->align_shift);
 
 	if (unlikely(!initial_segment)) {
 		batcher_destroy(batcher);
@@ -340,34 +342,26 @@ bool tm_end(shared_t shared, tx_t tx)
 	return true;
 }
 
-/** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
- * @param shared Shared memory region associated with the transaction
- * @param tx     Transaction to use
- * @param source Source start address (in the shared region)
- * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
- * @param target Target start address (in a private region)
- * @return Whether the whole transaction can continue
+/** Read shared words in a read-write transaction after API argument checks.
+ * Kept out of line so read-only accesses do not inherit the RW stack setup.
+ * @param region Region owning the shared words and their mutexes
+ * @param transaction Active read-write transaction accessing the words
+ * @param source Valid shared source address aligned to the region's word size
+ * @param size Positive byte count, a multiple of the region's word size
+ * @param target Private destination buffer, possibly unaligned
+ * @return true on success, or false after aborting the transaction on conflict
 **/
-bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
-	     void *target)
+#ifdef __GNUC__
+__attribute__((noinline))
+#endif
+static bool transaction_read_rw(region_t *region, transaction_t *transaction,
+				void const *source, size_t size, void *target)
 {
-	assert(shared != invalid_shared && source != NULL && target != NULL);
-	assert(tx != 0 && tx != invalid_tx);
-
-	transaction_t *transaction = (transaction_t *)tx;
-	region_t *region = (region_t *)shared;
-	assert(size > 0 && (size & (region->align - 1)) == 0);
-	assert(((uintptr_t)source & (region->align - 1)) == 0);
-	if (transaction->is_ro) {
-		// Public addresses refer to DATA_COMMITTED, stable until this batch ends.
-		// memcpy also accepts an unaligned private destination.
-		memcpy(target, source, size);
-		return true;
-	}
-
-	segment_t *segment = transaction_find_segment(region, transaction, source);
+	segment_t *segment =
+		transaction_find_segment(region, transaction, source);
 	assert(segment != NULL);
-	size_t offset = (uintptr_t)source - (uintptr_t)segment->data[DATA_COMMITTED];
+	size_t offset =
+		(uintptr_t)source - (uintptr_t)segment->data[DATA_COMMITTED];
 	assert(size <= segment->size - offset);
 
 	for (size_t done = 0; done < size; done += region->align) {
@@ -395,13 +389,46 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 			status->owner = invalid_tx;
 		}
 
-		unsigned int buffer = status->written ? DATA_PENDING : DATA_COMMITTED;
+		unsigned int buffer = status->written ? DATA_PENDING :
+							DATA_COMMITTED;
 		memcpy((unsigned char *)target + done,
 		       (unsigned char *)segment->data[buffer] + word_offset,
 		       region->align);
 		check_pthread(pthread_mutex_unlock(mutex));
 	}
 	return true;
+}
+
+/** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
+ * @param shared Shared memory region associated with the transaction
+ * @param tx     Transaction to use
+ * @param source Source start address (in the shared region)
+ * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
+ * @param target Target start address (in a private region)
+ * @return Whether the whole transaction can continue
+**/
+bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
+	     void *target)
+{
+	assert(shared != invalid_shared && source != NULL && target != NULL);
+	assert(tx != 0 && tx != invalid_tx);
+
+	transaction_t *transaction = (transaction_t *)tx;
+	region_t *region = (region_t *)shared;
+	assert(size > 0 && (size & (region->align - 1)) == 0);
+	assert(((uintptr_t)source & (region->align - 1)) == 0);
+	if (transaction->is_ro) {
+		// Public addresses refer to DATA_COMMITTED, stable until this batch ends.
+		// memcpy also accepts an unaligned private destination.
+		if (size == sizeof(uint64_t)) {
+			memcpy(target, source, sizeof(uint64_t));
+		} else {
+			memcpy(target, source, size);
+		}
+		return true;
+	}
+
+	return transaction_read_rw(region, transaction, source, size, target);
 }
 
 /** Record a word on its first write by the transaction.
@@ -455,9 +482,11 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 	assert(((uintptr_t)target & (region->align - 1)) == 0);
 	// The private source may be unaligned; memcpy handles byte buffers.
 	assert(!transaction->is_ro);
-	segment_t *segment = transaction_find_segment(region, transaction, target);
+	segment_t *segment =
+		transaction_find_segment(region, transaction, target);
 	assert(segment != NULL);
-	size_t offset = (uintptr_t)target - (uintptr_t)segment->data[DATA_COMMITTED];
+	size_t offset =
+		(uintptr_t)target - (uintptr_t)segment->data[DATA_COMMITTED];
 	assert(size <= segment->size - offset);
 
 	for (size_t done = 0; done < size; done += region->align) {
@@ -494,7 +523,8 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 			}
 		}
 
-		memcpy((unsigned char *)segment->data[DATA_PENDING] + word_offset,
+		memcpy((unsigned char *)segment->data[DATA_PENDING] +
+			       word_offset,
 		       (unsigned char const *)source + done, region->align);
 		status->access_state = ACCESS_ONE;
 		status->owner = transaction->id;
@@ -524,7 +554,8 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
 	transaction_t *transaction = (transaction_t *)tx;
 	assert(!transaction->is_ro);
 
-	segment_t *segment = segment_create(size, region->align, region->align_shift);
+	segment_t *segment =
+		segment_create(size, region->align, region->align_shift);
 
 	if (unlikely(!segment)) {
 		return nomem_alloc;
@@ -569,7 +600,8 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
 		}
 	}
 
-	segment_t *segment = transaction_find_segment(region, transaction, target);
+	segment_t *segment =
+		transaction_find_segment(region, transaction, target);
 	// Only the public base address of a live, accessible segment is valid.
 	assert(segment != NULL && segment->data[DATA_COMMITTED] == target);
 

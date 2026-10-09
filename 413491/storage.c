@@ -21,8 +21,10 @@ segment_t *segment_create(size_t size, size_t align, unsigned int align_shift)
 {
 	// calloc aligns the base for both structures; round the controls' offset too.
 	size_t status_align = _Alignof(word_status_t);
-	size_t status_offset = sizeof(segment_t) +
-		(status_align - sizeof(segment_t) % status_align) % status_align;
+	size_t status_offset =
+		sizeof(segment_t) +
+		(status_align - sizeof(segment_t) % status_align) %
+			status_align;
 	size_t word_count = size >> align_shift;
 	if (word_count > (SIZE_MAX - status_offset) / sizeof(word_status_t)) {
 		return NULL;
@@ -51,7 +53,8 @@ segment_t *segment_create(size_t size, size_t align, unsigned int align_shift)
 	segment->next = NULL;
 	segment->status = (word_status_t *)(base + status_offset);
 	segment->data[DATA_COMMITTED] = data;
-	segment->data[DATA_PENDING] = data + size; // size is a multiple of align.
+	segment->data[DATA_PENDING] =
+		data + size; // size is a multiple of align.
 	// Zeroed controls mean unwritten, epoch 0 and ACCESS_NONE.
 	// owner is ignored in ACCESS_NONE, so no per-word initialization is needed.
 	return segment;
@@ -69,7 +72,8 @@ segment_t *transaction_find_segment(const region_t *region,
 			return ref->segment;
 		}
 	}
-	for (segment_t *segment = region->head; segment; segment = segment->next) {
+	for (segment_t *segment = region->head; segment;
+	     segment = segment->next) {
 		uintptr_t base = (uintptr_t)segment->data[DATA_COMMITTED];
 		if (target >= base && target - base < segment->size) {
 			return segment;
