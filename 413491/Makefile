@@ -24,6 +24,10 @@ LD       := $(if $(SRCS_CXX),$(CXX),$(CC))
 LDFLAGS  := -shared
 LDLIBS   := -pthread
 
+ifeq ($(BATCHER_STATS),1)
+CPPFLAGS += -DBATCHER_STATS
+endif
+
 .PHONY: build clean
 
 build: $(BIN)
@@ -32,7 +36,7 @@ clean:
 
 define BUILD_C
 %.$(1).o: %.$(1) $$(HDRS_C) Makefile
-	$$(CC) $$(CCFLAGS) -c -o $$@ $$<
+	$$(CC) $$(CPPFLAGS) $$(CCFLAGS) -c -o $$@ $$<
 endef
 $(foreach EXT,$(EXT_C),$(eval $(call BUILD_C,$(EXT))))
 

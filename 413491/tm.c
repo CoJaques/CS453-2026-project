@@ -78,12 +78,13 @@ static void transaction_discard(transaction_t *transaction)
 static void transaction_abort(region_t *region, transaction_t *transaction)
 {
 	transaction_discard(transaction);
+	batcher_lock_for_leave(region->batcher);
 	batcher_leave(region->batcher);
 }
 
 /** Publish committed effects before the next batch starts running.
  * Called with the batcher mutex held and no active transactions in this region.
- * Must not lock that mutex again or call batcher_enter/leave/get_epoch.
+ * Must not lock that mutex again or call batcher_enter/leave.
  * @param context Region whose completed epoch is being finalized
 **/
 static void region_finalize_epoch(void *context)
@@ -308,8 +309,7 @@ tx_t tm_begin(shared_t shared, bool is_ro)
 	transaction->id = (tx_t)transaction;
 	transaction->is_ro = is_ro;
 
-	batcher_enter(region->batcher);
-	transaction->epoch = batcher_get_epoch(region->batcher);
+	transaction->epoch = batcher_enter(region->batcher);
 
 	return (tx_t)transaction;
 }
@@ -328,15 +328,16 @@ bool tm_end(shared_t shared, tx_t tx)
 
 	if (transaction->is_ro) {
 		free(transaction);
+		batcher_lock_for_leave(region->batcher);
 		batcher_leave(region->batcher);
 		return true;
 	}
 
 	// Retain the context and its logs until publication at the epoch boundary.
-	check_pthread(pthread_mutex_lock(&region->batcher->mutex));
+	// The mutex is unlocked on the batcher_leave call
+	batcher_lock_for_leave(region->batcher);
 	transaction->next_committed = region->committed;
 	region->committed = transaction;
-	check_pthread(pthread_mutex_unlock(&region->batcher->mutex));
 
 	batcher_leave(region->batcher);
 	return true;

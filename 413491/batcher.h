@@ -5,6 +5,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "sync.h"
+
+#ifdef BATCHER_STATS
+#include "batcher_stats.h"
+#endif
+
 // Called with the batcher mutex held, before advancing the epoch or waking threads.
 typedef void (*batcher_finalize_fn)(void *context);
 
@@ -16,6 +22,9 @@ typedef struct {
 	size_t waiting;
 	batcher_finalize_fn finalize_epoch;
 	void *finalize_context;
+#ifdef BATCHER_STATS
+	batcher_stats_t stats;
+#endif
 } batcher_t;
 
 /** Initialize a batcher before publishing it to other threads.
@@ -36,18 +45,36 @@ void batcher_destroy(batcher_t *batcher);
  * Each successful entry must be paired with one leave. Threads must not be
  * cancelled while waiting or participating in a batch.
  * @param batcher Batcher associated with the shared memory region
+ * @return Epoch number of the batch entered
 **/
-void batcher_enter(batcher_t *batcher);
+uint64_t batcher_enter(batcher_t *batcher);
 
-/** [thread-safe] Leave the current batch, admitting the next batch if last.
+/** Acquire the batcher mutex before preparing a commit or leaving the batch.
+ * Records acquisition latency when diagnostics are enabled; histogram updates
+ * are deferred until batcher_leave has released the mutex.
+ * @param batcher Batcher in which the caller is an active participant
+**/
+static inline void batcher_lock_for_leave(batcher_t *batcher)
+{
+#ifdef BATCHER_STATS
+	batcher_thread_stats_t *stats = pthread_getspecific(batcher->stats.key);
+	uint64_t started = batcher_stats_now();
+#endif
+	check_pthread(pthread_mutex_lock(&batcher->mutex));
+#ifdef BATCHER_STATS
+	uint64_t acquired = batcher_stats_now();
+	if (stats) {
+		stats->leave_wait_ns = acquired - started;
+		stats->leave_acquired_ns = acquired;
+		stats->leave_lock_pending = true;
+	}
+#endif
+}
+
+/** Leave the current batch with the mutex held, admitting the next batch if last.
  * The last participant runs the finalization callback while holding the mutex.
+ * The caller must first call batcher_lock_for_leave. This function releases
+ * the mutex, including when this participant is not the last one.
  * @param batcher Batcher previously entered by the calling thread
 **/
 void batcher_leave(batcher_t *batcher);
-
-/** [thread-safe] Get the epoch of the calling thread's current batch.
- * Only valid after enter returns and before the matching leave.
- * @param batcher Batcher currently entered by the calling thread
- * @return Current epoch number
-**/
-uint64_t batcher_get_epoch(batcher_t *batcher);
