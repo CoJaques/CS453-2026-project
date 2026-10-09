@@ -475,7 +475,6 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 			status->owner = invalid_tx;
 		}
 
-		unsigned int copy = 0;
 		if (status->written) {
 			if (status->access_state != ACCESS_ONE ||
 			    status->owner != transaction->id) {
@@ -496,7 +495,8 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size,
 		}
 
 		memcpy((unsigned char *)target + done,
-		       (unsigned char *)segment->data[1] + word_offset,
+		       (unsigned char *)segment->data[status->written ? 1 : 0] +
+			       word_offset,
 		       region->align);
 		if (pthread_mutex_unlock(mutex) != 0) {
 			abort();
