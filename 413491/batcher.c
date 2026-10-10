@@ -19,7 +19,18 @@
 bool batcher_init(batcher_t *batcher, batcher_finalize_fn finalize_epoch,
 		  void *context)
 {
-	if (pthread_mutex_init(&batcher->mutex, NULL) != 0) {
+	pthread_mutexattr_t attr;
+	if (pthread_mutexattr_init(&attr) != 0) {
+		return false;
+	}
+	// Briefly spin on admission/departure contention before sleeping.
+	if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP) != 0) {
+		check_pthread(pthread_mutexattr_destroy(&attr));
+		return false;
+	}
+	int result = pthread_mutex_init(&batcher->mutex, &attr);
+	check_pthread(pthread_mutexattr_destroy(&attr));
+	if (result != 0) {
 		return false;
 	}
 	batcher->epoch = 0;
