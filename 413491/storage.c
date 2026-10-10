@@ -55,8 +55,8 @@ segment_t *segment_create(size_t size, size_t align, unsigned int align_shift)
 	segment->data[DATA_COMMITTED] = data;
 	segment->data[DATA_PENDING] =
 		data + size; // size is a multiple of align.
-	// Zeroed controls mean unwritten, epoch 0 and ACCESS_NONE.
-	// owner is ignored in ACCESS_NONE, so no per-word initialization is needed.
+	// Zeroed controls mean unwritten, epoch 0 and no RW access (owner == 0).
+	// No per-word initialization is needed.
 	return segment;
 }
 

@@ -45,8 +45,7 @@ static inline void word_prepare_epoch(word_status_t *status, uint64_t epoch)
 	if (status->epoch != epoch) {
 		status->epoch = epoch;
 		status->written = false;
-		status->access_state = ACCESS_NONE;
-		status->owner = invalid_tx;
+		status->owner = 0;
 	}
 }
 
@@ -56,7 +55,9 @@ static inline void word_prepare_epoch(word_status_t *status, uint64_t epoch)
 static void transaction_discard(transaction_t *transaction)
 {
 	// Tentative writes are never published; word access marks expire by epoch.
-	free(transaction->written_words);
+	if (transaction->written_words != transaction->inline_words) {
+		free(transaction->written_words);
+	}
 	while (transaction->segment_to_free) {
 		segment_ref_t *ref = transaction->segment_to_free;
 		transaction->segment_to_free = ref->next;
@@ -160,7 +161,9 @@ static void region_finalize_epoch(void *context)
 	// Access metadata expires lazily; only the completed contexts need cleanup here.
 	while (committed) {
 		transaction_t *next = committed->next_committed;
-		free(committed->written_words);
+		if (committed->written_words != committed->inline_words) {
+			free(committed->written_words);
+		}
 		free(committed);
 		committed = next;
 	}
@@ -199,7 +202,8 @@ shared_t tm_create(size_t size, size_t align)
 		}
 	}
 
-	batcher_t *batcher = aligned_alloc(_Alignof(batcher_t), sizeof(batcher_t));
+	batcher_t *batcher =
+		aligned_alloc(_Alignof(batcher_t), sizeof(batcher_t));
 	if (unlikely(!batcher)) {
 		word_locks_destroy(region, WORD_LOCK_COUNT);
 		free(region);
@@ -311,6 +315,9 @@ tx_t tm_begin(shared_t shared, bool is_ro)
 
 	transaction->id = (tx_t)transaction;
 	transaction->is_ro = is_ro;
+	transaction->written_words = transaction->inline_words;
+	transaction->written_capacity =
+		sizeof(transaction->inline_words) / sizeof(word_ref_t);
 
 	transaction->epoch = batcher_enter(region->batcher, is_ro);
 
@@ -376,20 +383,14 @@ static bool transaction_read_rw(region_t *region, transaction_t *transaction,
 		check_pthread(pthread_mutex_lock(mutex));
 		word_prepare_epoch(status, transaction->epoch);
 
-		if (status->written) {
-			if (status->access_state != ACCESS_ONE ||
-			    status->owner != transaction->id) {
-				// Abort may destroy private segments, so release the word first.
-				check_pthread(pthread_mutex_unlock(mutex));
-				transaction_abort(region, transaction);
-				return false;
-			}
-		} else if (status->access_state == ACCESS_NONE) {
-			status->access_state = ACCESS_ONE;
+		if (status->written && status->owner != transaction->id) {
+			// Abort may destroy private segments, so release the word first.
+			check_pthread(pthread_mutex_unlock(mutex));
+			transaction_abort(region, transaction);
+			return false;
+		} else if (status->owner == 0) {
 			status->owner = transaction->id;
-		} else if (status->access_state == ACCESS_ONE &&
-			   status->owner != transaction->id) {
-			status->access_state = ACCESS_MANY;
+		} else if (status->owner != transaction->id) {
 			status->owner = invalid_tx;
 		}
 
@@ -450,11 +451,18 @@ static bool transaction_record_write(transaction_t *transaction,
 		if (capacity >= maximum) {
 			return false;
 		}
-		capacity = capacity == 0	  ? 8 :
-			   capacity > maximum / 2 ? maximum :
-						    capacity * 2;
-		word_ref_t *words = realloc(transaction->written_words,
-					    capacity * sizeof(word_ref_t));
+		capacity = capacity > maximum / 2 ? maximum : capacity * 2;
+		word_ref_t *words;
+		if (transaction->written_words == transaction->inline_words) {
+			words = malloc(capacity * sizeof(word_ref_t));
+			if (words) {
+				memcpy(words, transaction->inline_words,
+				       transaction->written_count * sizeof(word_ref_t));
+			}
+		} else {
+			words = realloc(transaction->written_words,
+					capacity * sizeof(word_ref_t));
+		}
 		if (!words) {
 			return false;
 		}
@@ -501,17 +509,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 		check_pthread(pthread_mutex_lock(mutex));
 		word_prepare_epoch(status, transaction->epoch);
 
-		bool authorized = false;
-		if (status->written) {
-			authorized = status->access_state == ACCESS_ONE &&
-				     status->owner == transaction->id;
-		} else {
-			authorized = status->access_state == ACCESS_NONE ||
-				     (status->access_state == ACCESS_ONE &&
-				      status->owner == transaction->id);
-		}
-
-		if (!authorized) {
+		if (status->owner != 0 && status->owner != transaction->id) {
 			check_pthread(pthread_mutex_unlock(mutex));
 			transaction_abort(shared, transaction);
 			return false;
@@ -530,7 +528,6 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 		memcpy((unsigned char *)segment->data[DATA_PENDING] +
 			       word_offset,
 		       (unsigned char const *)source + done, region->align);
-		status->access_state = ACCESS_ONE;
 		status->owner = transaction->id;
 		status->written = true;
 

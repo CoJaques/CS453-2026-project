@@ -4,14 +4,12 @@
 #include "batcher.h"
 #include <stdbool.h>
 
-typedef enum { ACCESS_NONE = 0, ACCESS_ONE, ACCESS_MANY } access_state_t;
 enum { DATA_COMMITTED = 0, DATA_PENDING = 1 };
 enum { WORD_LOCK_COUNT = 1024 };
 
 typedef struct {
 	uint64_t epoch; // Epoch of the access and write metadata.
-	tx_t owner; // Meaningful only when access_state is ACCESS_ONE.
-	access_state_t access_state; // Read-write transactions only.
+	tx_t owner; // RW accesses: 0 = none, invalid_tx = multiple, otherwise sole ID.
 	bool written; // Whether the word was written during epoch.
 } word_status_t;
 
@@ -58,4 +56,5 @@ struct transaction_t {
 	segment_ref_t *segment_allocated;
 	segment_ref_t *segment_to_free;
 	transaction_t *next_committed;
+	word_ref_t inline_words[2]; // Small write logs share the context allocation.
 };
