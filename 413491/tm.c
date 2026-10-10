@@ -36,6 +36,20 @@
 #include "storage.h"
 #include "sync.h"
 
+/** Copy a transactional word, specializing the common eight-byte size.
+ * @param target Destination buffer, possibly unaligned
+ * @param source Non-overlapping source buffer, possibly unaligned
+ * @param size Word size in bytes
+ **/
+static inline void word_copy(void *target, const void *source, size_t size)
+{
+	if (size == sizeof(uint64_t)) {
+		memcpy(target, source, sizeof(uint64_t));
+	} else {
+		memcpy(target, source, size);
+	}
+}
+
 /** Reset obsolete word access metadata while its mutex is held by the caller.
  * @param status Word control protected by the acquired mutex
  * @param epoch Epoch of the transaction accessing the word
@@ -105,12 +119,11 @@ static void region_finalize_epoch(void *context)
 		for (size_t i = 0; i < tx->written_count; ++i) {
 			word_ref_t word = tx->written_words[i];
 			size_t offset = word.index << region->align_shift;
-			memcpy((unsigned char *)word.segment
-					       ->data[DATA_COMMITTED] +
-				       offset,
-			       (unsigned char *)word.segment->data[DATA_PENDING] +
-				       offset,
-			       region->align);
+			word_copy((unsigned char *)word.segment->data[DATA_COMMITTED] +
+					  offset,
+				  (unsigned char *)word.segment->data[DATA_PENDING] +
+					  offset,
+				  region->align);
 		}
 	}
 
@@ -396,9 +409,9 @@ static bool transaction_read_rw(region_t *region, transaction_t *transaction,
 
 		unsigned int buffer = status->written ? DATA_PENDING :
 							DATA_COMMITTED;
-		memcpy((unsigned char *)target + done,
-		       (unsigned char *)segment->data[buffer] + word_offset,
-		       region->align);
+		word_copy((unsigned char *)target + done,
+			  (unsigned char *)segment->data[buffer] + word_offset,
+			  region->align);
 		check_pthread(pthread_mutex_unlock(mutex));
 	}
 	return true;
@@ -525,9 +538,8 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
 			}
 		}
 
-		memcpy((unsigned char *)segment->data[DATA_PENDING] +
-			       word_offset,
-		       (unsigned char const *)source + done, region->align);
+		word_copy((unsigned char *)segment->data[DATA_PENDING] + word_offset,
+			  (unsigned char const *)source + done, region->align);
 		status->owner = transaction->id;
 		status->written = true;
 
