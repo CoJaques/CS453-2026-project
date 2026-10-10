@@ -9,6 +9,13 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#ifndef BATCHER_SPIN_LIMIT
+#define BATCHER_SPIN_LIMIT 128
+#endif
+#if BATCHER_SPIN_LIMIT < 0
+#error "BATCHER_SPIN_LIMIT must be nonnegative"
+#endif
+
 bool batcher_init(batcher_t *batcher, batcher_finalize_fn finalize_epoch,
 		  void *context)
 {
@@ -38,6 +45,21 @@ void batcher_destroy(batcher_t *batcher)
 **/
 static void batcher_wait(batcher_t *batcher, uint32_t notification)
 {
+	// Spin once, with a fixed budget; long waits still sleep in the kernel.
+	unsigned int spins = BATCHER_SPIN_LIMIT;
+	while (spins-- != 0) {
+		if (atomic_load_explicit(&batcher->changed, memory_order_acquire) !=
+		    notification) {
+			return;
+		}
+#if defined(__x86_64__) || defined(__i386__)
+		__builtin_ia32_pause();
+#elif defined(__aarch64__)
+		__asm__ __volatile__("yield" ::: "memory");
+#else
+		atomic_signal_fence(memory_order_seq_cst);
+#endif
+	}
 	// Acquire makes the published snapshot visible. Futex checks the value
 	// before sleeping, avoiding a lost wake between this load and the syscall.
 	while (atomic_load_explicit(&batcher->changed, memory_order_acquire) ==

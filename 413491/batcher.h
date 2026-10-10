@@ -14,13 +14,15 @@ typedef void (*batcher_finalize_fn)(void *context);
 typedef struct {
 	pthread_mutex_t mutex;
 	uint64_t epoch; // Protected by mutex; stable throughout each active batch.
-	_Atomic uint32_t changed; // Publication signal and Linux futex word.
 	size_t remaining; // Protected by mutex, including during finalization.
 	size_t waiting;
 	bool closed_ro; // Protected by mutex; first RW commit closes RO admissions.
 	bool closed_rw; // Protected by mutex; first RW abort closes RW admissions.
 	batcher_finalize_fn finalize_epoch;
 	void *finalize_context;
+	// Keep polling off the mutex/counters' cache lines. Heap instances must
+	// use aligned_alloc(_Alignof(batcher_t), sizeof(batcher_t)).
+	_Alignas(64) _Atomic uint32_t changed; // Publication signal and Linux futex word.
 } batcher_t;
 
 /** Initialize a batcher before publishing it to other threads.

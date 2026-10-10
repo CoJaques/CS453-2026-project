@@ -199,7 +199,7 @@ shared_t tm_create(size_t size, size_t align)
 		}
 	}
 
-	batcher_t *batcher = malloc(sizeof(batcher_t));
+	batcher_t *batcher = aligned_alloc(_Alignof(batcher_t), sizeof(batcher_t));
 	if (unlikely(!batcher)) {
 		word_locks_destroy(region, WORD_LOCK_COUNT);
 		free(region);
